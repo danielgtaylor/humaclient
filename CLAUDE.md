@@ -1,0 +1,68 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+See @README.md for a project overview.
+
+## Project Rules
+
+### General Rules
+
+- Follow modern idiomatic Go naming conventions and practices
+- Explicit is better than magic
+- Prefer structs for configuration (no fluent or builder patterns), but functional options are okay when appropriate if they make usage more ergonomic (for example, it may be easier to set a custom query param via a functional option than by defining a struct with a `url.Values` object with the param)
+- Simple is better than complex
+- Developer experience of the generated SDK is important
+- Generated code should be standalone without any dependencies. The code generator can use dependencies.
+- Write tests for all new features and added code, and check for reasonable coverage
+- Changes should not break existing users
+- Tell me if something cannot work, and give me alternative approaches
+- Use `any` instead of `interface{}`
+
+### Generator Rules
+
+- The generated SDK client should be exposed as an interface to facilitate easy mocking during testing
+- Always use `text/template` for templating
+- Prefer Huma objects like `huma.API`, `huma.OpenAPI`, `huma.Schema` when available
+- Every schema of type `object` in the registry must be generated as a Go struct and used in operation methods
+- Every operation in the API that returns `application/json` must be callable from the generated SDK
+- The SDK interface and methods should use the API and operation ID converted to camel case using `github.com/danielgtaylor/casing` via `casing.Camel`, `casing.Snake`, `casing.LowerCamel`, etc. Use `casing.Camel` instead of `strings.Title(casing.LowerCamel(...))`
+- Required parameters like path params should be required arguments to the operation methods
+- Optional parameters should use an optional struct
+- Every operation with optional parameters should have its own optional struct
+- Use `context.Context` for all API calls
+- Users should be able to customize the `http.Client` used by the SDK, for example to set global timeouts or auth headers.
+- Users should be able to customize the outgoing `http.Request`, e.g. add custom headers
+- Users should be able to access the `http.Response` as well as the unmarshaled body or error
+- Generate a package name and client interface from the API name by default, but let users customize it
+- Whenever possible, sort generated code in a consistent manner (e.g. by HTTP method, then by path or by parameter name) so there are minimal diffs between generation invocations
+- You should skip `$schema` fields as these mostly aren't useful for the client SDK.
+- Circular references in types should be allowed via pointers in the generated Go code, for example using `huma.Schema` as a request or response body field.
+
+## Development Commands
+
+### Building
+
+```bash
+go build
+```
+
+### Running
+
+```bash
+go run humaclient.go
+```
+
+### Testing
+
+```bash
+go test ./...
+```
+
+### Formatting
+
+```bash
+go fmt ./...
+```
