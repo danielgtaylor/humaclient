@@ -1163,7 +1163,7 @@ func (c *{{.ClientStructName}}) Follow(ctx context.Context, link string, result 
 func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error] {
 	return func(yield func({{.ItemType}}, error) bool) {
 		// Start with the first page
-		resp, items, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}{{if .HasRequestBody}}, body{{end}}, opts...)
+		resp, items, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
 		if err != nil {
 			var zero {{.ItemType}}
 			if !yield(zero, err) {
