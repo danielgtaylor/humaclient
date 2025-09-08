@@ -20,6 +20,7 @@ type Options struct {
 	PackageName     string   // Custom package name (default: generated from API title)
 	ClientName      string   // Custom client interface name (default: generated from API title)
 	AllowedPackages []string // List of allowed Go packages that can be referenced instead of recreated
+	OutputDirectory string   // Custom output directory (default: package name in current directory)
 }
 
 // ClientTemplateData holds data for client code generation
@@ -126,7 +127,10 @@ func GenerateClientWithOptions(api huma.API, opts Options) error {
 	}
 
 	// Create output directory
-	outputDir := packageName
+	outputDir := opts.OutputDirectory
+	if outputDir == "" {
+		outputDir = packageName
+	}
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}

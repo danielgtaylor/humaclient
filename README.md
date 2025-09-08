@@ -109,6 +109,24 @@ humaclient.RegisterWithOptions(api, humaclient.Options{
 })
 ```
 
+### Custom Output Directory
+
+You can customize the output directory where the generated SDK is created.
+
+```go
+import (
+	"github.com/danielgtaylor/humaclient"
+)
+
+// ...
+
+humaclient.RegisterWithOptions(api, humaclient.Options{
+	OutputDirectory: "./generated/clients/myapi",
+})
+```
+
+If not specified, the generated SDK will be placed in a directory named after the package name in the current working directory.
+
 ### Custom Client
 
 You can provide a custom HTTP client to handle e.g. authentication using functionality built into the Go standard library:
