@@ -236,6 +236,55 @@ type Thing struct {
 
 The inclusion of the `doc`, `minLength`, and `pattern` validation fields is preserved so they can be re-used as a request or response object in another Huma API. All of the fields at https://huma.rocks/features/request-validation/ are supported.
 
+### Model Referencing
+
+In some cases the models may come from a shared package, allowing for easier reuse across different services. The generated SDK code supports this by opting-in to the list of allowed packages that can be imported and used in the generated code.
+
+```go
+humaclient.RegisterWithOptions(api, humaclient.Options{
+	AllowedPackages: []string{"github.com/danielgtaylor/huma/v2"}
+})
+```
+
+If, for example, an operation returns a `huma.Schema` response body, the generated code will now reference import `github.com/danielgtaylor/huma/v2` and the generated operation will return a `huma.Schema` as well rather than redefining the `Schema` struct in the generated code.
+
+Use this feature with care as you can unintentionally break clients by changing shared library code!
+
+## Development
+
+### CI/CD Pipeline
+
+This project uses GitHub Actions for continuous integration and delivery. The pipeline runs on every push and pull request.
+
+### Running Tests Locally
+
+```bash
+# Run all tests
+go test ./...
+
+# Run tests with coverage
+go test -v -race -coverprofile=coverage.out ./...
+
+# Run benchmarks
+go test -bench=. -benchmem ./...
+
+# Test client generation
+cd example
+GENERATE_CLIENT=1 go run main.go
+```
+
+### Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes and add tests
+4. Ensure all tests pass and linting is clean
+5. Commit your changes (`git commit -m 'Add amazing feature'`)
+6. Push to the branch (`git push origin feature/amazing-feature`)
+7. Open a Pull Request
+
+The CI pipeline will automatically run all tests and quality checks on your PR.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE.md](LICENSE.md) file for details.

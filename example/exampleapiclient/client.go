@@ -34,7 +34,7 @@ type ErrorModel struct {
 // Thing represents the Thing schema
 type Thing struct {
 	DeprecatedField string `json:"deprecatedField" doc:"This field is deprecated" deprecated:"true"`
-	ID              string `json:"id" doc:"The unique identifier for the thing" minLength:"8" pattern:"^[a-z0-9_-]+$" example:"thing123"`
+	ID              string `json:"id" doc:"The unique identifier for the thing" minLength:"8" pattern:"^[a-z0-9_-]+$"`
 	Name            string `json:"name" doc:"The name of the thing" minLength:"3" example:"My Thing"`
 	ReadOnlyID      string `json:"readOnlyId" doc:"Read-only identifier" readOnly:"true"`
 	WriteOnlyToken  string `json:"writeOnlyToken" doc:"Write-only authentication token" writeOnly:"true"`
