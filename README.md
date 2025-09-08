@@ -5,6 +5,7 @@ A library to generate simple clients in Go for interacting with [Huma](https://g
 - Generate a client SDK directly from a `huma.API` definition.
 - Convenient hook to add one-line client generation to your APIs.
 - Maintains Huma docs/validation tags for model re-use in other APIs.
+- Built-in support for paginated responses via `Link` headers with `rel=next`.
 
 These are _not_ supported:
 
@@ -178,6 +179,21 @@ client.ListThings(ctx, exampleapiclient.WithOptions(exampleapiclient.ListThingsO
 	Cursor: "abc123",
 	Limit: 100,
 }))
+```
+
+### Pagination
+
+Pagination is supported via the standard `Link` header with a relationship like `rel=next`. If that header is documented in your API and the response returns a list of resources, then a method will be generated to provide an iterator that returns each item in the collection, transparently fetching the next request as needed until no pages remain.
+
+```go
+// Example of using the pagination iterator
+for item, err := range client.ListThingsPaginator(ctx) {
+	if err != nil {
+		fmt.Println("Error:", err)
+		break
+	}
+	fmt.Println(item)
+}
 ```
 
 ### Following Links

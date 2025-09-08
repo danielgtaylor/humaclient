@@ -22,6 +22,7 @@ type GetThingResponse struct {
 }
 
 type ListThingsResponse struct {
+	Link string `header:"Link" doc:"Link to the next page of results"`
 	Body []Thing
 }
 
@@ -41,7 +42,13 @@ func main() {
 		}, nil
 	})
 
-	huma.Get(api, "/things", func(ctx context.Context, input *struct {
+	huma.Register(api, huma.Operation{
+		OperationID: "list-things",
+		Method:      http.MethodGet,
+		Path:        "/things",
+		Summary:     "List things",
+		Description: "Returns a paginated list of things",
+	}, func(ctx context.Context, input *struct {
 		Limit  int    `query:"limit" doc:"Maximum number of items to return" default:"10"`
 		Cursor string `query:"cursor" doc:"Pagination cursor"`
 	}) (*ListThingsResponse, error) {
