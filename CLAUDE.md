@@ -20,6 +20,7 @@ See @README.md for a project overview.
 - Changes should not break existing users
 - Tell me if something cannot work, and give me alternative approaches
 - Use `any` instead of `interface{}`
+- When generating test files, they should go into their own directory to avoid package name conflicts with the repo root directory
 
 ### Generator Rules
 

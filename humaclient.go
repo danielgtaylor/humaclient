@@ -870,10 +870,26 @@ func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, i
 			return "string"
 		}
 	case "integer":
-		if schema.Format == "int64" {
+		switch schema.Format {
+		case "int64":
 			return "int64"
+		case "int32":
+			return "int32"
+		case "int16":
+			return "int16"
+		case "int8":
+			return "int8"
+		case "uint64":
+			return "uint64"
+		case "uint32":
+			return "uint32"
+		case "uint16":
+			return "uint16"
+		case "uint8":
+			return "uint8"
+		default:
+			return "int"
 		}
-		return "int"
 	case "number":
 		if schema.Format == "float" {
 			return "float32"
