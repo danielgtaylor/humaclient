@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -10,7 +11,7 @@ import (
 )
 
 type Thing struct {
-	ID              string `json:"id" doc:"The unique identifier for the thing" minLength:"8" pattern:"^[a-z0-9_-]+$" example:"thing123"`
+	ID              string `json:"id" doc:"The unique identifier for the thing" minLength:"8" pattern:"^[a-z0-9_-]+$"`
 	Name            string `json:"name" doc:"The name of the thing" minLength:"3" example:"My Thing"`
 	ReadOnlyID      string `json:"readOnlyId" doc:"Read-only identifier" readOnly:"true"`
 	WriteOnlyToken  string `json:"writeOnlyToken" doc:"Write-only authentication token" writeOnly:"true"`
@@ -63,5 +64,5 @@ func main() {
 	// Register for client generation
 	humaclient.Register(api)
 
-	http.ListenAndServe(":8080", mux)
+	log.Fatal(http.ListenAndServe(":8080", mux))
 }

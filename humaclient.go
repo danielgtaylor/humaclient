@@ -17,8 +17,9 @@ import (
 
 // Options provides customization options for client generation
 type Options struct {
-	PackageName string // Custom package name (default: generated from API title)
-	ClientName  string // Custom client interface name (default: generated from API title)
+	PackageName     string   // Custom package name (default: generated from API title)
+	ClientName      string   // Custom client interface name (default: generated from API title)
+	AllowedPackages []string // List of allowed Go packages that can be referenced instead of recreated
 }
 
 // ClientTemplateData holds data for client code generation
@@ -27,6 +28,7 @@ type ClientTemplateData struct {
 	ClientInterfaceName string
 	ClientStructName    string
 	Imports             []string
+	ExternalImports     []string // External packages that are allowed to be referenced
 	Schemas             []SchemaData
 	Operations          []OperationData
 	RequestOptionFields []OptionField
@@ -35,9 +37,11 @@ type ClientTemplateData struct {
 
 // SchemaData represents an OpenAPI schema for code generation
 type SchemaData struct {
-	Name       string
-	StructName string
-	Fields     []FieldData
+	Name         string
+	StructName   string
+	Fields       []FieldData
+	IsExternal   bool   // Whether this schema comes from an external allowed package
+	ExternalType string // Full external type name (e.g., "huma.Schema")
 }
 
 // FieldData represents a field in a struct
@@ -219,20 +223,27 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, opts Options) 
 	sort.Strings(data.Imports)
 
 	// Generate schemas
-	if err := buildSchemas(&data.Schemas, openapi); err != nil {
+	externalImports := make(map[string]bool)
+	if err := buildSchemas(&data.Schemas, openapi, opts.AllowedPackages, externalImports); err != nil {
 		return nil, fmt.Errorf("failed to build schemas: %w", err)
 	}
 
 	// Generate operations
-	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi); err != nil {
+	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi, opts.AllowedPackages, externalImports); err != nil {
 		return nil, fmt.Errorf("failed to build operations: %w", err)
 	}
+
+	// Add external imports to the imports list
+	for pkg := range externalImports {
+		data.ExternalImports = append(data.ExternalImports, "\""+pkg+"\"")
+	}
+	sort.Strings(data.ExternalImports)
 
 	return data, nil
 }
 
 // buildSchemas generates schema data from OpenAPI components
-func buildSchemas(schemas *[]SchemaData, openapi *huma.OpenAPI) error {
+func buildSchemas(schemas *[]SchemaData, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
 	if openapi.Components == nil || openapi.Components.Schemas == nil {
 		return nil
 	}
@@ -253,8 +264,17 @@ func buildSchemas(schemas *[]SchemaData, openapi *huma.OpenAPI) error {
 				StructName: casing.Camel(name, casing.Initialism),
 			}
 
-			if err := buildFields(&schemaData.Fields, schema, openapi); err != nil {
-				return fmt.Errorf("failed to build fields for %s: %w", name, err)
+			// Check if this schema comes from an allowed external package
+			pkg, typeName := getExternalPackageAndType(openapi, name, allowedPackages)
+			if pkg != "" {
+				schemaData.IsExternal = true
+				schemaData.ExternalType = typeName
+				externalImports[pkg] = true
+			} else {
+				// Only build fields for internal types
+				if err := buildFields(&schemaData.Fields, schema, openapi, allowedPackages, externalImports); err != nil {
+					return fmt.Errorf("failed to build fields for %s: %w", name, err)
+				}
 			}
 
 			*schemas = append(*schemas, schemaData)
@@ -264,8 +284,50 @@ func buildSchemas(schemas *[]SchemaData, openapi *huma.OpenAPI) error {
 	return nil
 }
 
+// getExternalPackageAndType checks if a schema name corresponds to an external type from an allowed package
+func getExternalPackageAndType(openapi *huma.OpenAPI, schemaName string, allowedPackages []string) (packageName string, typeName string) {
+	if openapi.Components == nil || openapi.Components.Schemas == nil {
+		return "", ""
+	}
+
+	// Use TypeFromRef to get the Go type info
+	goType := openapi.Components.Schemas.TypeFromRef("#/components/schemas/" + schemaName)
+	if goType == nil {
+		return "", ""
+	}
+
+	// Extract package path and type name from the reflect.Type
+	pkg := goType.PkgPath()
+	name := goType.Name()
+
+	if pkg == "" || name == "" {
+		return "", ""
+	}
+
+	// Check if the package is in the allowed list
+	for _, allowedPkg := range allowedPackages {
+		if pkg == allowedPkg {
+			// Get the package name from the import path (last segment)
+			parts := strings.Split(pkg, "/")
+			pkgName := parts[len(parts)-1]
+
+			// Handle versioned packages like /v2, /v3, etc.
+			if strings.HasPrefix(pkgName, "v") && len(pkgName) > 1 {
+				// For versioned packages, use the parent directory + version (e.g., huma instead of v2)
+				if len(parts) > 1 {
+					pkgName = parts[len(parts)-2]
+				}
+			}
+
+			return pkg, pkgName + "." + name
+		}
+	}
+
+	return "", ""
+}
+
 // buildFields generates field data from schema properties
-func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI) error {
+func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
 	if schema.Properties == nil {
 		return nil
 	}
@@ -290,7 +352,7 @@ func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI
 
 		// Use pointer for circular references: if field references same type as parent OR field is nullable
 		usePointer := isFieldNullable || isCircularReference(propSchema, schema, openapi)
-		goType := schemaToGoTypeWithNullability(propSchema, openapi, usePointer)
+		goType := schemaToGoTypeWithNullability(propSchema, openapi, usePointer, allowedPackages, externalImports)
 
 		jsonTag := propName
 		if isFieldNullable {
@@ -416,7 +478,7 @@ func buildHumaTags(schema *huma.Schema) string {
 }
 
 // buildOperations generates operation data from OpenAPI paths
-func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, openapi *huma.OpenAPI) error {
+func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
 	allOptions := make(map[string]OptionField)
 
 	// Sort paths for consistent output
@@ -474,13 +536,13 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 			if operation.RequestBody != nil && operation.RequestBody.Content != nil {
 				if jsonContent := operation.RequestBody.Content["application/json"]; jsonContent != nil {
 					opData.HasRequestBody = true
-					opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi)
+					opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi, allowedPackages, externalImports)
 					opData.HasOptionalBody = !operation.RequestBody.Required
 				}
 			}
 
 			// Handle return type
-			opData.ReturnType, opData.ZeroValue = generateReturnType(operation, openapi)
+			opData.ReturnType, opData.ZeroValue = generateReturnType(operation, openapi, allowedPackages, externalImports)
 
 			// Check for pagination support
 			if isPaginatedOperation(operation, openapi) {
@@ -490,7 +552,7 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 					if statusCode[0] == '2' && response.Content != nil {
 						if jsonContent := response.Content["application/json"]; jsonContent != nil {
 							if jsonContent.Schema != nil && jsonContent.Schema.Type == "array" && jsonContent.Schema.Items != nil {
-								opData.ItemType = schemaToGoType(jsonContent.Schema.Items, openapi)
+								opData.ItemType = schemaToGoType(jsonContent.Schema.Items, openapi, allowedPackages, externalImports)
 								break
 							}
 						}
@@ -499,7 +561,7 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 			}
 
 			// Handle parameters
-			if err := buildOperationParams(&opData, operation, allOptions, openapi); err != nil {
+			if err := buildOperationParams(&opData, operation, allOptions, openapi, allowedPackages, externalImports); err != nil {
 				return fmt.Errorf("failed to build params for %s %s: %w", method, path, err)
 			}
 
@@ -519,7 +581,7 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 }
 
 // buildOperationParams builds parameter data for an operation
-func buildOperationParams(opData *OperationData, operation *huma.Operation, allOptions map[string]OptionField, openapi *huma.OpenAPI) error {
+func buildOperationParams(opData *OperationData, operation *huma.Operation, allOptions map[string]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
 	if operation.Parameters == nil {
 		return nil
 	}
@@ -534,7 +596,7 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, allO
 		}
 
 		if param.Schema != nil {
-			paramData.Type = schemaToGoType(param.Schema, openapi)
+			paramData.Type = schemaToGoType(param.Schema, openapi, allowedPackages, externalImports)
 		}
 
 		switch param.In {
@@ -672,7 +734,7 @@ func generateMethodName(operation *huma.Operation) string {
 }
 
 // generateReturnType generates the return type for an operation method
-func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI) (string, string) {
+func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) (string, string) {
 	// Find the success response (200, 201, etc.)
 	var responseSchema *huma.Schema
 	for statusCode, response := range operation.Responses {
@@ -686,7 +748,7 @@ func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI) (strin
 
 	responseType := "any"
 	if responseSchema != nil {
-		responseType = schemaToGoType(responseSchema, openapi)
+		responseType = schemaToGoType(responseSchema, openapi, allowedPackages, externalImports)
 	}
 
 	zeroValue := getZeroValue(responseType)
@@ -755,12 +817,12 @@ func isRequired(schema *huma.Schema, propName string) bool {
 }
 
 // schemaToGoType converts an OpenAPI schema type to a Go type
-func schemaToGoType(schema *huma.Schema, openapi *huma.OpenAPI) string {
-	return schemaToGoTypeWithNullability(schema, openapi, false)
+func schemaToGoType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) string {
+	return schemaToGoTypeWithNullability(schema, openapi, false, allowedPackages, externalImports)
 }
 
 // schemaToGoTypeWithNullability converts an OpenAPI schema type to a Go type with optional nullability
-func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, isNullable bool) string {
+func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, isNullable bool, allowedPackages []string, externalImports map[string]bool) string {
 	switch schema.Type {
 	case "string":
 		return "string"
@@ -778,7 +840,7 @@ func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, i
 		return "bool"
 	case "array":
 		if schema.Items != nil {
-			itemType := schemaToGoType(schema.Items, openapi)
+			itemType := schemaToGoType(schema.Items, openapi, allowedPackages, externalImports)
 			return "[]" + itemType
 		}
 		return "[]any"
@@ -788,6 +850,18 @@ func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, i
 			parts := strings.Split(schema.Ref, "/")
 			if len(parts) > 0 {
 				refName := parts[len(parts)-1]
+
+				// Check if this is an external type
+				pkg, extTypeName := getExternalPackageAndType(openapi, refName, allowedPackages)
+				if pkg != "" {
+					externalImports[pkg] = true
+					if isNullable {
+						return "*" + extTypeName
+					}
+					return extTypeName
+				}
+
+				// Use local type name
 				typeName := casing.Camel(refName, casing.Initialism)
 
 				// If this field is nullable, use pointer to break circular references
@@ -806,6 +880,18 @@ func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, i
 		parts := strings.Split(schema.Ref, "/")
 		if len(parts) > 0 {
 			refName := parts[len(parts)-1]
+
+			// Check if this is an external type
+			pkg, extTypeName := getExternalPackageAndType(openapi, refName, allowedPackages)
+			if pkg != "" {
+				externalImports[pkg] = true
+				if isNullable {
+					return "*" + extTypeName
+				}
+				return extTypeName
+			}
+
+			// Use local type name
 			typeName := casing.Camel(refName, casing.Initialism)
 
 			// If this field is nullable, use pointer to break circular references
@@ -858,16 +944,21 @@ import (
 {{- range .Imports}}
 	{{.}}
 {{- end}}
+{{- range .ExternalImports}}
+	{{.}}
+{{- end}}
 )
 
 {{/* Generate structs from schemas */}}
 {{- range .Schemas}}
+{{- if not .IsExternal}}
 // {{.StructName}} represents the {{.Name}} schema
 type {{.StructName}} struct {
 {{- range .Fields}}
 	{{.Name}} {{.Type}} ` + "`json:\"{{.JSONTag}}\"{{.HumaTags}}`" + `
 {{- end}}
 }
+{{- end}}
 {{end}}
 
 {{/* Generate option function types */}}

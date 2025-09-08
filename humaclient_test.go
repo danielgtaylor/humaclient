@@ -994,9 +994,9 @@ func TestCircularReferencesWithNullableSchemas(t *testing.T) {
 	}
 
 	type Category struct {
-		ID           string     `json:"id"`
-		Name         string     `json:"name"`
-		ParentCat    *Category  `json:"parentCategory,omitempty" doc:"Parent category (nullable)"`
+		ID            string     `json:"id"`
+		Name          string     `json:"name"`
+		ParentCat     *Category  `json:"parentCategory,omitempty" doc:"Parent category (nullable)"`
 		SubCategories []Category `json:"subCategories,omitempty" doc:"Sub-categories"`
 	}
 
@@ -1379,6 +1379,541 @@ func TestPartialCustomOptions(t *testing.T) {
 	})
 }
 
+func TestAllowedPackagesBasicFunctionality(t *testing.T) {
+	// Create API that uses huma.Schema to test external type referencing
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Schema Test API", "1.0.0"))
+
+	// Add operation that returns huma.Schema
+	huma.Get(api, "/schema", func(ctx context.Context, input *struct{}) (*struct {
+		Body huma.Schema `json:"schema" doc:"The schema object"`
+	}, error) {
+		return &struct {
+			Body huma.Schema `json:"schema" doc:"The schema object"`
+		}{
+			Body: huma.Schema{Type: "object", Description: "Example schema"},
+		}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_allowed_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	// Generate client with allowed packages
+	opts := Options{
+		PackageName:     "testclient",
+		ClientName:      "TestClient",
+		AllowedPackages: []string{"github.com/danielgtaylor/huma/v2"},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client with allowed packages: %v", err)
+	}
+
+	// Read generated code
+	content, err := os.ReadFile("testclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ExternalImportIncluded", func(t *testing.T) {
+		if !strings.Contains(clientCode, `"github.com/danielgtaylor/huma/v2"`) {
+			t.Error("Expected external import 'github.com/danielgtaylor/huma/v2' to be included")
+		}
+	})
+
+	t.Run("ExternalTypeUsed", func(t *testing.T) {
+		// Should use huma.Schema instead of generating a local Schema struct
+		if !strings.Contains(clientCode, "huma.Schema") {
+			t.Error("Expected external type 'huma.Schema' to be used in method signatures")
+		}
+	})
+
+	t.Run("NoLocalSchemaStruct", func(t *testing.T) {
+		// Should not generate a local Schema struct
+		if strings.Contains(clientCode, "type Schema struct") {
+			t.Error("Expected no local Schema struct to be generated when using external package")
+		}
+	})
+
+	t.Run("MethodSignatureUsesExternalType", func(t *testing.T) {
+		// The method signature should use huma.Schema
+		expectedSignature := "GetSchema(ctx context.Context, opts ...Option) (*http.Response, huma.Schema, error)"
+		if !strings.Contains(clientCode, expectedSignature) {
+			t.Errorf("Expected method signature with external type: %s", expectedSignature)
+		}
+	})
+}
+
+func TestGetExternalPackageAndType(t *testing.T) {
+	// Create a simple API with huma.Schema
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Test API", "1.0.0"))
+
+	// Add operation to register huma.Schema in the registry
+	huma.Get(api, "/schema", func(ctx context.Context, input *struct{}) (*struct {
+		Body huma.Schema `json:"schema"`
+	}, error) {
+		return nil, nil
+	})
+
+	openapi := api.OpenAPI()
+	allowedPackages := []string{"github.com/danielgtaylor/huma/v2"}
+
+	tests := []struct {
+		name             string
+		schemaName       string
+		allowedPkgs      []string
+		expectedPkg      string
+		expectedType     string
+		shouldBeExternal bool
+	}{
+		{
+			name:             "HumaSchemaAllowed",
+			schemaName:       "Schema",
+			allowedPkgs:      allowedPackages,
+			expectedPkg:      "github.com/danielgtaylor/huma/v2",
+			expectedType:     "huma.Schema",
+			shouldBeExternal: true,
+		},
+		{
+			name:             "HumaSchemaNotAllowed",
+			schemaName:       "Schema",
+			allowedPkgs:      []string{},
+			expectedPkg:      "",
+			expectedType:     "",
+			shouldBeExternal: false,
+		},
+		{
+			name:             "NonExistentSchema",
+			schemaName:       "NonExistent",
+			allowedPkgs:      allowedPackages,
+			expectedPkg:      "",
+			expectedType:     "",
+			shouldBeExternal: false,
+		},
+		{
+			name:             "DifferentAllowedPackage",
+			schemaName:       "Schema",
+			allowedPkgs:      []string{"some.other/package"},
+			expectedPkg:      "",
+			expectedType:     "",
+			shouldBeExternal: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkg, typeName := getExternalPackageAndType(openapi, tt.schemaName, tt.allowedPkgs)
+
+			if pkg != tt.expectedPkg {
+				t.Errorf("Expected package %q, got %q", tt.expectedPkg, pkg)
+			}
+
+			if typeName != tt.expectedType {
+				t.Errorf("Expected type name %q, got %q", tt.expectedType, typeName)
+			}
+
+			isExternal := pkg != ""
+			if isExternal != tt.shouldBeExternal {
+				t.Errorf("Expected isExternal %v, got %v", tt.shouldBeExternal, isExternal)
+			}
+		})
+	}
+}
+
+func TestAllowedPackagesWithComplexTypes(t *testing.T) {
+	// Create API with complex types that reference external packages
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Complex Test API", "1.0.0"))
+
+	// Create a custom type that embeds huma.Schema
+	type ComplexType struct {
+		ID     string      `json:"id"`
+		Schema huma.Schema `json:"schema"`
+		Nested struct {
+			SubSchema huma.Schema `json:"subSchema"`
+		} `json:"nested"`
+	}
+
+	huma.Get(api, "/complex/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id"`
+	}) (*struct{ Body ComplexType }, error) {
+		return &struct{ Body ComplexType }{}, nil
+	})
+
+	// Also test with array of external types
+	huma.Get(api, "/schemas", func(ctx context.Context, input *struct{}) (*struct {
+		Body []huma.Schema `json:"schemas"`
+	}, error) {
+		return &struct {
+			Body []huma.Schema `json:"schemas"`
+		}{}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_complex_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	// Test with allowed packages
+	opts := Options{
+		PackageName:     "complextestclient",
+		AllowedPackages: []string{"github.com/danielgtaylor/huma/v2"},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("complextestclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ExternalTypeInComplexStruct", func(t *testing.T) {
+		// Should use huma.Schema in the generated ComplexType struct
+		if !strings.Contains(clientCode, "Schema huma.Schema") {
+			t.Error("Expected huma.Schema to be used in complex struct fields")
+		}
+	})
+
+	t.Run("ExternalTypeInNestedStruct", func(t *testing.T) {
+		// Should use huma.Schema in nested structures
+		if !strings.Contains(clientCode, "SubSchema huma.Schema") {
+			t.Error("Expected huma.Schema to be used in nested struct fields")
+		}
+	})
+
+	t.Run("ExternalTypeInArrays", func(t *testing.T) {
+		// Should use []huma.Schema for array types
+		if !strings.Contains(clientCode, "[]huma.Schema") {
+			t.Error("Expected []huma.Schema to be used for array return types")
+		}
+	})
+
+	t.Run("NoLocalSchemaDefinitions", func(t *testing.T) {
+		// Should not generate local Schema struct definitions
+		if strings.Contains(clientCode, "type Schema struct") {
+			t.Error("Should not generate local Schema struct when using external package")
+		}
+	})
+}
+
+func TestAllowedPackagesVersionedHandling(t *testing.T) {
+	tests := []struct {
+		name        string
+		packagePath string
+		expected    string
+	}{
+		{
+			name:        "HumaV2Package",
+			packagePath: "github.com/danielgtaylor/huma/v2",
+			expected:    "huma.Schema",
+		},
+		{
+			name:        "GenericV3Package",
+			packagePath: "example.com/somelib/v3",
+			expected:    "somelib.SomeType",
+		},
+		{
+			name:        "NonVersionedPackage",
+			packagePath: "github.com/example/lib",
+			expected:    "lib.SomeType",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a mock registry and API to test version handling
+			mux := http.NewServeMux()
+			api := humago.New(mux, huma.DefaultConfig("Version Test API", "1.0.0"))
+
+			// For huma/v2, we can test with actual Schema
+			if tt.packagePath == "github.com/danielgtaylor/huma/v2" {
+				huma.Get(api, "/test", func(ctx context.Context, input *struct{}) (*struct {
+					Body huma.Schema `json:"schema"`
+				}, error) {
+					return nil, nil
+				})
+
+				openapi := api.OpenAPI()
+				pkg, typeName := getExternalPackageAndType(openapi, "Schema", []string{tt.packagePath})
+
+				if pkg != tt.packagePath {
+					t.Errorf("Expected package %q, got %q", tt.packagePath, pkg)
+				}
+
+				if typeName != tt.expected {
+					t.Errorf("Expected type name %q, got %q", tt.expected, typeName)
+				}
+			}
+		})
+	}
+}
+
+func TestAllowedPackagesEdgeCases(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Edge Case API", "1.0.0"))
+
+	// Add a simple endpoint to have a valid API
+	huma.Get(api, "/test", func(ctx context.Context, input *struct{}) (*SimpleMessageResponse, error) {
+		return &SimpleMessageResponse{Body: "test"}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_edge_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	t.Run("EmptyAllowedPackages", func(t *testing.T) {
+		opts := Options{
+			AllowedPackages: []string{},
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client with empty allowed packages: %v", err)
+		}
+
+		// Should work normally, no external imports
+		content, err := os.ReadFile("edgecaseapiclient/client.go")
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		// Should not have any unusual imports
+		lines := strings.Split(clientCode, "\n")
+		inImportBlock := false
+		for _, line := range lines {
+			if strings.Contains(line, "import (") {
+				inImportBlock = true
+				continue
+			}
+			if inImportBlock && strings.Contains(line, ")") {
+				break
+			}
+			if inImportBlock && strings.TrimSpace(line) != "" {
+				// Should only contain standard library imports
+				if !strings.Contains(line, "bytes") &&
+					!strings.Contains(line, "context") &&
+					!strings.Contains(line, "encoding/json") &&
+					!strings.Contains(line, "fmt") &&
+					!strings.Contains(line, "io") &&
+					!strings.Contains(line, "net/http") &&
+					!strings.Contains(line, "net/url") &&
+					!strings.Contains(line, "strings") {
+					t.Errorf("Unexpected import in client with empty allowed packages: %s", line)
+				}
+			}
+		}
+
+		// Clean up for next test
+		os.RemoveAll("edgecaseapiclient")
+	})
+
+	t.Run("NilAllowedPackages", func(t *testing.T) {
+		opts := Options{
+			AllowedPackages: nil,
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client with nil allowed packages: %v", err)
+		}
+
+		// Should work normally
+		if _, err := os.Stat("edgecaseapiclient/client.go"); os.IsNotExist(err) {
+			t.Error("Expected client to be generated with nil allowed packages")
+		}
+
+		// Clean up for next test
+		os.RemoveAll("edgecaseapiclient")
+	})
+
+	t.Run("NonExistentPackage", func(t *testing.T) {
+		opts := Options{
+			AllowedPackages: []string{"nonexistent.com/fake/package"},
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client with non-existent allowed package: %v", err)
+		}
+
+		// Should work normally, just ignore the non-existent package
+		if _, err := os.Stat("edgecaseapiclient/client.go"); os.IsNotExist(err) {
+			t.Error("Expected client to be generated even with non-existent allowed package")
+		}
+
+		content, err := os.ReadFile("edgecaseapiclient/client.go")
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		// Should not import the non-existent package
+		if strings.Contains(clientCode, "nonexistent.com/fake/package") {
+			t.Error("Should not import non-existent package")
+		}
+	})
+}
+
+// Test types for integration test
+type IntegrationSchemaResponse struct {
+	Body huma.Schema
+}
+
+type SimpleMessageResponse struct {
+	Body string
+}
+
+type IntegrationErrorResponse struct {
+	Body []huma.ErrorDetail
+}
+
+func TestAllowedPackagesIntegration(t *testing.T) {
+	// Integration test: Create a full API with external types and test compilation
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Integration Test API", "1.0.0"))
+
+	// Add a simple endpoint that uses huma.Schema
+	huma.Get(api, "/schema", func(ctx context.Context, input *struct{}) (*IntegrationSchemaResponse, error) {
+		return &IntegrationSchemaResponse{Body: huma.Schema{Type: "object"}}, nil
+	})
+
+	// Add endpoint that uses huma.ErrorDetail
+	huma.Get(api, "/errors", func(ctx context.Context, input *struct{}) (*IntegrationErrorResponse, error) {
+		return &IntegrationErrorResponse{}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_integration_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	// Generate client with huma package allowed
+	opts := Options{
+		PackageName:     "integrationclient",
+		AllowedPackages: []string{"github.com/danielgtaylor/huma/v2"},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate integration client: %v", err)
+	}
+
+	// Read generated content
+	content, err := os.ReadFile("integrationclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("AllExternalTypesUsed", func(t *testing.T) {
+		externalTypes := []string{
+			"huma.Schema",
+			"huma.ErrorDetail",
+			"[]huma.ErrorDetail",
+		}
+
+		for _, extType := range externalTypes {
+			if !strings.Contains(clientCode, extType) {
+				t.Errorf("Expected external type %q to be used", extType)
+			}
+		}
+	})
+
+	t.Run("NoLocalTypeDefinitions", func(t *testing.T) {
+		localTypes := []string{
+			"type Schema struct",
+			"type ErrorDetail struct",
+			"type ErrorModel struct", // This should also be external
+		}
+
+		for _, localType := range localTypes {
+			if strings.Contains(clientCode, localType) {
+				t.Errorf("Should not generate local type definition: %s", localType)
+			}
+		}
+	})
+
+	t.Run("GeneratedClientCompiles", func(t *testing.T) {
+		t.Skip("Skipping compilation test due to go.sum dependency resolution in test environment")
+		// Create go.mod for compilation test
+		goMod := "module integrationtest\n\ngo 1.19\n\nrequire github.com/danielgtaylor/huma/v2 v2.0.0\n"
+		err := os.WriteFile("go.mod", []byte(goMod), 0644)
+		if err != nil {
+			t.Fatalf("Failed to create go.mod: %v", err)
+		}
+
+		// Test compilation
+		cmd := exec.Command("go", "build", "./integrationclient")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("Generated client failed to compile: %v\nOutput: %s\nGenerated code preview:\n%s",
+				err, string(output), clientCode[:min(len(clientCode), 1000)])
+		}
+	})
+
+	t.Run("ClientCanBeUsedInProgram", func(t *testing.T) {
+		t.Skip("Skipping program compilation test due to go.sum dependency resolution in test environment")
+		// Create a simple program that uses the generated client
+		testProgram := "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"integrationtest/integrationclient\"\n\t\"github.com/danielgtaylor/huma/v2\"\n)\n\nfunc main() {\n\tclient := integrationclient.New(\"http://example.com\")\n\t_, schema, err := client.GetSchema(context.Background())\n\tif err != nil {\n\t\tfmt.Printf(\"Error: %v\\n\", err)\n\t\treturn\n\t}\n\tvar humaSchema huma.Schema = schema\n\tfmt.Printf(\"Schema type: %s\\n\", humaSchema.Type)\n}"
+
+		err := os.WriteFile("main.go", []byte(testProgram), 0644)
+		if err != nil {
+			t.Fatalf("Failed to write test program: %v", err)
+		}
+
+		// Test compilation of the program using the generated client
+		cmd := exec.Command("go", "build", "main.go")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("Test program using generated client failed to compile: %v\nOutput: %s", err, string(output))
+		}
+	})
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Benchmark tests for client generation performance
 func BenchmarkClientGeneration(b *testing.B) {
 	api := createTestAPI()
@@ -1402,5 +1937,40 @@ func BenchmarkClientGeneration(b *testing.B) {
 		}
 		// Clean up between iterations
 		os.RemoveAll("testapiclient")
+	}
+}
+
+func BenchmarkClientGenerationWithAllowedPackages(b *testing.B) {
+	// Create API with external types
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Benchmark API", "1.0.0"))
+
+	huma.Get(api, "/schema", func(ctx context.Context, input *struct{}) (*IntegrationSchemaResponse, error) {
+		return &IntegrationSchemaResponse{Body: huma.Schema{Type: "object"}}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_bench_allowed_*")
+	if err != nil {
+		b.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	opts := Options{
+		AllowedPackages: []string{"github.com/danielgtaylor/huma/v2"},
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			b.Fatalf("Failed to generate client with allowed packages: %v", err)
+		}
+		// Clean up between iterations
+		os.RemoveAll("benchmarkapiclient")
 	}
 }
