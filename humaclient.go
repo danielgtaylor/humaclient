@@ -65,6 +65,8 @@ type OperationData struct {
 	HeaderParams      []ParamData
 	OptionsStructName string
 	OptionsFields     []OptionField
+	IsPaginated       bool
+	ItemType          string
 }
 
 // ParamData represents a parameter
@@ -208,6 +210,12 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, opts Options) 
 		"\"net/url\"",
 		"\"strings\"",
 	}
+
+	// Add iter import if we have paginated operations
+	if hasPaginatedOperations(openapi) {
+		data.Imports = append(data.Imports, "\"iter\"")
+	}
+
 	sort.Strings(data.Imports)
 
 	// Generate schemas
@@ -474,6 +482,22 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 			// Handle return type
 			opData.ReturnType, opData.ZeroValue = generateReturnType(operation, openapi)
 
+			// Check for pagination support
+			if isPaginatedOperation(operation, openapi) {
+				opData.IsPaginated = true
+				// Extract item type from array return type
+				for statusCode, response := range operation.Responses {
+					if statusCode[0] == '2' && response.Content != nil {
+						if jsonContent := response.Content["application/json"]; jsonContent != nil {
+							if jsonContent.Schema != nil && jsonContent.Schema.Type == "array" && jsonContent.Schema.Items != nil {
+								opData.ItemType = schemaToGoType(jsonContent.Schema.Items, openapi)
+								break
+							}
+						}
+					}
+				}
+			}
+
 			// Handle parameters
 			if err := buildOperationParams(&opData, operation, allOptions, openapi); err != nil {
 				return fmt.Errorf("failed to build params for %s %s: %w", method, path, err)
@@ -518,31 +542,37 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, allO
 			opData.HasQueryParams = true
 			opData.QueryParams = append(opData.QueryParams, paramData)
 
-			// Add to global options
-			optField := OptionField{
-				Name:     paramData.GoName,
-				Type:     paramData.Type,
-				JSONName: param.Name,
-				Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", param.Name),
-				In:       "query",
+			// Add to global options (avoid duplicates)
+			optKey := fmt.Sprintf("%s_%s", paramData.GoName, param.In)
+			if _, exists := allOptions[optKey]; !exists {
+				optField := OptionField{
+					Name:     paramData.GoName,
+					Type:     paramData.Type,
+					JSONName: param.Name,
+					Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", param.Name),
+					In:       "query",
+				}
+				allOptions[optKey] = optField
+				opData.OptionsFields = append(opData.OptionsFields, optField)
 			}
-			allOptions[paramData.GoName] = optField
-			opData.OptionsFields = append(opData.OptionsFields, optField)
 
 		case "header":
 			opData.HasHeaderParams = true
 			opData.HeaderParams = append(opData.HeaderParams, paramData)
 
-			// Add to global options
-			optField := OptionField{
-				Name:     paramData.GoName,
-				Type:     paramData.Type,
-				JSONName: param.Name,
-				Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", param.Name),
-				In:       "header",
+			// Add to global options (avoid duplicates)
+			optKey := fmt.Sprintf("%s_%s", paramData.GoName, param.In)
+			if _, exists := allOptions[optKey]; !exists {
+				optField := OptionField{
+					Name:     paramData.GoName,
+					Type:     paramData.Type,
+					JSONName: param.Name,
+					Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", param.Name),
+					In:       "header",
+				}
+				allOptions[optKey] = optField
+				opData.OptionsFields = append(opData.OptionsFields, optField)
 			}
-			allOptions[paramData.GoName] = optField
-			opData.OptionsFields = append(opData.OptionsFields, optField)
 		}
 	}
 
@@ -561,6 +591,42 @@ func hasRequestBodies(openapi *huma.OpenAPI) bool {
 			if operation.RequestBody != nil && operation.RequestBody.Content != nil {
 				if operation.RequestBody.Content["application/json"] != nil {
 					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// hasPaginatedOperations checks if any operation in the API supports pagination
+func hasPaginatedOperations(openapi *huma.OpenAPI) bool {
+	for _, pathItem := range openapi.Paths {
+		for _, operation := range getOperations(pathItem) {
+			if isPaginatedOperation(operation, openapi) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isPaginatedOperation checks if an operation supports pagination
+func isPaginatedOperation(operation *huma.Operation, openapi *huma.OpenAPI) bool {
+	if operation.Responses == nil {
+		return false
+	}
+
+	// Check if operation returns an array and has Link header
+	for statusCode, response := range operation.Responses {
+		if statusCode[0] == '2' && response.Content != nil {
+			if jsonContent := response.Content["application/json"]; jsonContent != nil {
+				if jsonContent.Schema != nil && jsonContent.Schema.Type == "array" {
+					// Check if response defines Link header
+					if response.Headers != nil {
+						if linkHeader := response.Headers["Link"]; linkHeader != nil {
+							return true
+						}
+					}
 				}
 			}
 		}
@@ -917,6 +983,9 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 type {{.ClientInterfaceName}} interface {
 {{- range .Operations}}
 	{{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}}
+{{- if .IsPaginated}}
+	{{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error]
+{{- end}}
 {{- end}}
 	Follow(ctx context.Context, link string, result any, opts ...Option) (*http.Response, error)
 }
@@ -1085,5 +1154,93 @@ func (c *{{.ClientStructName}}) Follow(ctx context.Context, link string, result 
 	}
 
 	return resp, nil
+}
+
+{{/* Generate paginator method implementations */}}
+{{- range .Operations}}
+{{- if .IsPaginated}}
+// {{.MethodName}}Paginator returns an iterator that fetches all pages of {{.MethodName}} results
+func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error] {
+	return func(yield func({{.ItemType}}, error) bool) {
+		// Start with the first page
+		resp, items, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
+		if err != nil {
+			var zero {{.ItemType}}
+			if !yield(zero, err) {
+				return
+			}
+			return
+		}
+
+		// Yield all items from the first page
+		for _, item := range items {
+			if !yield(item, nil) {
+				return
+			}
+		}
+
+		// Follow pagination links
+		for {
+			// Check for Link header with rel=next
+			linkHeader := resp.Header.Get("Link")
+			if linkHeader == "" {
+				break
+			}
+
+			// Parse Link header to find next URL
+			nextURL := parseLinkHeader(linkHeader, "next")
+			if nextURL == "" {
+				break
+			}
+
+			// Fetch next page using Follow method
+			var nextItems []{{.ItemType}}
+			resp, err = c.Follow(ctx, nextURL, &nextItems, opts...)
+			if err != nil {
+				var zero {{.ItemType}}
+				if !yield(zero, err) {
+					return
+				}
+				return
+			}
+
+			// Yield all items from this page
+			for _, item := range nextItems {
+				if !yield(item, nil) {
+					return
+				}
+			}
+		}
+	}
+}
+{{- end}}
+{{- end}}
+
+// parseLinkHeader parses a Link header and returns the URL for the specified relation
+func parseLinkHeader(linkHeader, rel string) string {
+	// Simple parser for Link header format: <url>; rel="next", <url2>; rel="prev"
+	links := strings.Split(linkHeader, ",")
+	for _, link := range links {
+		link = strings.TrimSpace(link)
+		parts := strings.Split(link, ";")
+		if len(parts) < 2 {
+			continue
+		}
+
+		url := strings.Trim(strings.TrimSpace(parts[0]), "<>")
+
+		for _, param := range parts[1:] {
+			param = strings.TrimSpace(param)
+			if strings.Contains(param, "rel=") {
+				// Extract rel value (handle both quoted and unquoted)
+				relValue := strings.TrimPrefix(param, "rel=")
+				relValue = strings.Trim(relValue, "\"'")
+				if relValue == rel {
+					return url
+				}
+			}
+		}
+	}
+	return ""
 }
 `

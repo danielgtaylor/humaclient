@@ -3,18 +3,27 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/danielgtaylor/humaclient/example/exampleapiclient"
 )
 
 func main() {
+	ctx := context.Background()
 	client := exampleapiclient.New("http://localhost:8080")
 
-	_, things, err := client.ListThings(context.Background())
-	if err != nil {
-		fmt.Printf("Error listing things: %v\n", err)
-		return
-	}
+	for item, err := range client.ListThingsPaginator(ctx) {
+		if err != nil {
+			log.Printf("Error during pagination: %v", err)
+			break
+		}
+		fmt.Printf("Thing: %v\n", item)
 
-	fmt.Printf("Things: %v\n", things)
+		_, thing, err := client.GetThingsByID(ctx, item.ID)
+		if err != nil {
+			log.Printf("Error getting thing by ID %v: %v", item.ID, err)
+			continue
+		}
+		fmt.Printf("Fetched thing by ID: %v, name: %s\n", thing.ID, thing.Name)
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
 	"net/url"
 	"strings"
@@ -129,6 +130,7 @@ func (o ListThingsOptions) Apply(opts *RequestOptions) {
 // ExampleAPIClient defines the interface for the API client
 type ExampleAPIClient interface {
 	ListThings(ctx context.Context, opts ...Option) (*http.Response, []Thing, error)
+	ListThingsPaginator(ctx context.Context, opts ...Option) iter.Seq2[Thing, error]
 	GetThingsByID(ctx context.Context, id string, opts ...Option) (*http.Response, Thing, error)
 	Follow(ctx context.Context, link string, result any, opts ...Option) (*http.Response, error)
 }
@@ -325,4 +327,87 @@ func (c *ExampleAPIClientImpl) Follow(ctx context.Context, link string, result a
 	}
 
 	return resp, nil
+}
+
+// ListThingsPaginator returns an iterator that fetches all pages of ListThings results
+func (c *ExampleAPIClientImpl) ListThingsPaginator(ctx context.Context, opts ...Option) iter.Seq2[Thing, error] {
+	return func(yield func(Thing, error) bool) {
+		// Start with the first page
+		resp, items, err := c.ListThings(ctx, opts...)
+		if err != nil {
+			var zero Thing
+			if !yield(zero, err) {
+				return
+			}
+			return
+		}
+
+		// Yield all items from the first page
+		for _, item := range items {
+			if !yield(item, nil) {
+				return
+			}
+		}
+
+		// Follow pagination links
+		for {
+			// Check for Link header with rel=next
+			linkHeader := resp.Header.Get("Link")
+			if linkHeader == "" {
+				break
+			}
+
+			// Parse Link header to find next URL
+			nextURL := parseLinkHeader(linkHeader, "next")
+			if nextURL == "" {
+				break
+			}
+
+			// Fetch next page using Follow method
+			var nextItems []Thing
+			resp, err = c.Follow(ctx, nextURL, &nextItems, opts...)
+			if err != nil {
+				var zero Thing
+				if !yield(zero, err) {
+					return
+				}
+				return
+			}
+
+			// Yield all items from this page
+			for _, item := range nextItems {
+				if !yield(item, nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// parseLinkHeader parses a Link header and returns the URL for the specified relation
+func parseLinkHeader(linkHeader, rel string) string {
+	// Simple parser for Link header format: <url>; rel="next", <url2>; rel="prev"
+	links := strings.Split(linkHeader, ",")
+	for _, link := range links {
+		link = strings.TrimSpace(link)
+		parts := strings.Split(link, ";")
+		if len(parts) < 2 {
+			continue
+		}
+
+		url := strings.Trim(strings.TrimSpace(parts[0]), "<>")
+
+		for _, param := range parts[1:] {
+			param = strings.TrimSpace(param)
+			if strings.Contains(param, "rel=") {
+				// Extract rel value (handle both quoted and unquoted)
+				relValue := strings.TrimPrefix(param, "rel=")
+				relValue = strings.Trim(relValue, "\"'")
+				if relValue == rel {
+					return url
+				}
+			}
+		}
+	}
+	return ""
 }
