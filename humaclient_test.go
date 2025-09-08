@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1973,4 +1974,166 @@ func BenchmarkClientGenerationWithAllowedPackages(b *testing.B) {
 		// Clean up between iterations
 		os.RemoveAll("benchmarkapiclient")
 	}
+}
+
+func TestStringFormatToGoTypeConversion(t *testing.T) {
+	// Test models with various string formats
+	type EventRecord struct {
+		ID         string    `json:"id"`
+		EventTime  time.Time `json:"eventTime" format:"date-time"`
+		ServerIP   net.IP    `json:"serverIp" format:"ipv4"`
+		ClientIPv6 net.IP    `json:"clientIpv6" format:"ipv6"`
+	}
+
+	// Create API with formatted string fields
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Format Test API", "1.0.0"))
+
+	huma.Get(api, "/events/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id"`
+	}) (*struct{ Body EventRecord }, error) {
+		return &struct{ Body EventRecord }{
+			Body: EventRecord{
+				ID: input.ID,
+			},
+		}, nil
+	})
+
+	// Test client generation
+	tempDir, err := os.MkdirTemp("", "humaclient_format_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client with formatted strings: %v", err)
+	}
+
+	// Read the generated code
+	clientFile := "formattestapiclient/client.go"
+	content, err := os.ReadFile(clientFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("TimeFormatsUseTimeType", func(t *testing.T) {
+		// Check that date-time format uses time.Time
+		if !strings.Contains(clientCode, "EventTime  time.Time") {
+			t.Error("Expected date-time format field to use time.Time type")
+		}
+	})
+
+	t.Run("IPFormatsUseIPType", func(t *testing.T) {
+		// Check that ipv4 format uses net.IP
+		if !strings.Contains(clientCode, "ServerIP   net.IP") {
+			t.Error("Expected ipv4 format field to use net.IP type")
+		}
+
+		// Check that ipv6 format uses net.IP
+		if !strings.Contains(clientCode, "ClientIpv6 net.IP") {
+			t.Error("Expected ipv6 format field to use net.IP type")
+		}
+	})
+
+	t.Run("RequiredImportsIncluded", func(t *testing.T) {
+		// Check that time package is imported
+		if !strings.Contains(clientCode, `"time"`) {
+			t.Error("Expected time package to be imported")
+		}
+
+		// Check that net package is imported
+		if !strings.Contains(clientCode, `"net"`) {
+			t.Error("Expected net package to be imported")
+		}
+
+		// Note: net/url is already in default imports, so we don't need to check for it
+	})
+
+	t.Run("GeneratedCodeCompiles", func(t *testing.T) {
+		// Parse the generated client code to verify syntax
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated client code with format conversions has syntax errors: %v", err)
+		}
+	})
+}
+
+func TestStringFormatToGoTypeConversionNullable(t *testing.T) {
+	// Test nullable formatted string fields
+	type OptionalEventRecord struct {
+		ID           string     `json:"id"`
+		OptionalTime *time.Time `json:"optionalTime,omitempty" format:"date-time"`
+		OptionalIP   net.IP     `json:"optionalIp,omitempty" format:"ipv4"` // net.IP is already nullable
+	}
+
+	// Create API with nullable formatted fields
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Nullable Format Test API", "1.0.0"))
+
+	huma.Get(api, "/optional-events/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id"`
+	}) (*struct{ Body OptionalEventRecord }, error) {
+		return &struct{ Body OptionalEventRecord }{
+			Body: OptionalEventRecord{
+				ID: input.ID,
+			},
+		}, nil
+	})
+
+	// Test client generation
+	tempDir, err := os.MkdirTemp("", "humaclient_nullable_format_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client with nullable formatted strings: %v", err)
+	}
+
+	// Read the generated code
+	clientFile := "nullableformattestapiclient/client.go"
+	content, err := os.ReadFile(clientFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("NullableTimeFormatsUsePointerTimeType", func(t *testing.T) {
+		// Check that nullable date-time format uses *time.Time
+		if !strings.Contains(clientCode, "*time.Time") {
+			t.Error("Expected nullable date-time format field to use *time.Time type")
+		}
+	})
+
+	t.Run("NullableIPFormatsUseIPType", func(t *testing.T) {
+		// Check that nullable ipv4 format uses net.IP (already nullable)
+		if !strings.Contains(clientCode, "net.IP") {
+			t.Error("Expected nullable ipv4 format field to use net.IP type")
+		}
+	})
+
+	t.Run("GeneratedCodeCompiles", func(t *testing.T) {
+		// Parse the generated client code to verify syntax
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated client code with nullable format conversions has syntax errors: %v", err)
+		}
+	})
 }
