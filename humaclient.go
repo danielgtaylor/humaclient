@@ -237,6 +237,22 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, opts Options) 
 		return nil, fmt.Errorf("failed to build operations: %w", err)
 	}
 
+	// Add standard library imports that were collected as external imports
+	var keysToDelete []string
+	for pkg := range externalImports {
+		switch pkg {
+		case "time", "net":
+			// Add standard library imports to main imports
+			data.Imports = append(data.Imports, "\""+pkg+"\"")
+			keysToDelete = append(keysToDelete, pkg)
+		}
+	}
+	// Remove standard library imports from external imports
+	for _, pkg := range keysToDelete {
+		delete(externalImports, pkg)
+	}
+	sort.Strings(data.Imports)
+
 	// Add external imports to the imports list
 	for pkg := range externalImports {
 		data.ExternalImports = append(data.ExternalImports, "\""+pkg+"\"")
@@ -829,7 +845,30 @@ func schemaToGoType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages 
 func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, isNullable bool, allowedPackages []string, externalImports map[string]bool) string {
 	switch schema.Type {
 	case "string":
-		return "string"
+		// Handle well-known string formats
+		switch schema.Format {
+		case "date-time", "datetime":
+			// Add required import for time package
+			if externalImports != nil {
+				externalImports["time"] = true
+			}
+			if isNullable {
+				return "*time.Time"
+			}
+			return "time.Time"
+		case "ipv4", "ipv6", "ip":
+			// Use net.IP for IP addresses
+			if externalImports != nil {
+				externalImports["net"] = true
+			}
+			// net.IP is already a slice, so nullable means []byte vs net.IP
+			if isNullable {
+				return "net.IP" // net.IP can be nil naturally
+			}
+			return "net.IP"
+		default:
+			return "string"
+		}
 	case "integer":
 		if schema.Format == "int64" {
 			return "int64"
@@ -884,6 +923,34 @@ func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, i
 		parts := strings.Split(schema.Ref, "/")
 		if len(parts) > 0 {
 			refName := parts[len(parts)-1]
+
+			// Check if the referenced schema is a formatted string that should map to a Go type
+			if openapi != nil && openapi.Components != nil && openapi.Components.Schemas != nil {
+				schemaMap := openapi.Components.Schemas.Map()
+				if referencedSchema, exists := schemaMap[refName]; exists {
+					if referencedSchema.Type == "string" && referencedSchema.Format != "" {
+						// Handle referenced formatted strings
+						switch referencedSchema.Format {
+						case "date-time", "datetime":
+							if externalImports != nil {
+								externalImports["time"] = true
+							}
+							if isNullable {
+								return "*time.Time"
+							}
+							return "time.Time"
+						case "ipv4", "ipv6", "ip":
+							if externalImports != nil {
+								externalImports["net"] = true
+							}
+							if isNullable {
+								return "net.IP" // net.IP can be nil naturally
+							}
+							return "net.IP"
+						}
+					}
+				}
+			}
 
 			// Check if this is an external type
 			pkg, extTypeName := getExternalPackageAndType(openapi, refName, allowedPackages)
