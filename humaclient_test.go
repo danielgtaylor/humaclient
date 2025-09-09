@@ -2137,3 +2137,116 @@ func TestStringFormatToGoTypeConversionNullable(t *testing.T) {
 		}
 	})
 }
+
+func TestIntegerFormatToGoTypeConversion(t *testing.T) {
+	// Test models with various integer formats
+	type IntegerTypesRecord struct {
+		ID           string `json:"id"`
+		SmallSigned  int8   `json:"smallSigned" format:"int8" minimum:"-128" maximum:"127"`
+		ShortSigned  int16  `json:"shortSigned" format:"int16" minimum:"-32768" maximum:"32767"`
+		RegularInt   int32  `json:"regularInt" format:"int32" minimum:"-2147483648" maximum:"2147483647"`
+		LargeSigned  int64  `json:"largeSigned" format:"int64"`
+		SmallUnsigned uint8  `json:"smallUnsigned" format:"uint8" minimum:"0" maximum:"255"`
+		ShortUnsigned uint16 `json:"shortUnsigned" format:"uint16" minimum:"0" maximum:"65535"`
+		RegularUint   uint32 `json:"regularUint" format:"uint32" minimum:"0" maximum:"4294967295"`
+		LargeUnsigned uint64 `json:"largeUnsigned" format:"uint64" minimum:"0"`
+	}
+
+	// Create API with integer format fields
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Integer Format Test API", "1.0.0"))
+
+	huma.Get(api, "/integers/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id"`
+	}) (*struct {
+		Body IntegerTypesRecord
+	}, error) {
+		return &struct {
+			Body IntegerTypesRecord
+		}{
+			Body: IntegerTypesRecord{
+				ID: input.ID,
+				SmallSigned:   42,
+				ShortSigned:   1024,
+				RegularInt:    100000,
+				LargeSigned:   9223372036854775807,
+				SmallUnsigned: 255,
+				ShortUnsigned: 65535,
+				RegularUint:   4294967295,
+				LargeUnsigned: 18446744073709551615,
+			},
+		}, nil
+	})
+
+	// Test client generation
+	tempDir, err := os.MkdirTemp("", "humaclient_integer_format_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client with integer formats: %v", err)
+	}
+
+	// Read the generated code
+	clientFile := "integerformattestapiclient/client.go"
+	content, err := os.ReadFile(clientFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("SignedIntegerFormatsUseCorrectTypes", func(t *testing.T) {
+		// Check that int8 format uses int8 type
+		if !strings.Contains(clientCode, "SmallSigned   int8") {
+			t.Error("Expected int8 format field to use int8 type")
+		}
+		// Check that int16 format uses int16 type
+		if !strings.Contains(clientCode, "ShortSigned   int16") {
+			t.Error("Expected int16 format field to use int16 type")
+		}
+		// Check that int32 format uses int32 type
+		if !strings.Contains(clientCode, "RegularInt    int32") {
+			t.Error("Expected int32 format field to use int32 type")
+		}
+		// Check that int64 format uses int64 type
+		if !strings.Contains(clientCode, "LargeSigned   int64") {
+			t.Error("Expected int64 format field to use int64 type")
+		}
+	})
+
+	t.Run("UnsignedIntegerFormatsUseCorrectTypes", func(t *testing.T) {
+		// Check that uint8 format uses uint8 type
+		if !strings.Contains(clientCode, "SmallUnsigned uint8") {
+			t.Error("Expected uint8 format field to use uint8 type")
+		}
+		// Check that uint16 format uses uint16 type
+		if !strings.Contains(clientCode, "ShortUnsigned uint16") {
+			t.Error("Expected uint16 format field to use uint16 type")
+		}
+		// Check that uint32 format uses uint32 type
+		if !strings.Contains(clientCode, "RegularUint   uint32") {
+			t.Error("Expected uint32 format field to use uint32 type")
+		}
+		// Check that uint64 format uses uint64 type
+		if !strings.Contains(clientCode, "LargeUnsigned uint64") {
+			t.Error("Expected uint64 format field to use uint64 type")
+		}
+	})
+
+	t.Run("GeneratedCodeCompiles", func(t *testing.T) {
+		// Parse the generated client code to verify syntax
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated client code with integer formats has syntax errors: %v", err)
+		}
+	})
+}
