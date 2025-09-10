@@ -21,6 +21,7 @@ See @README.md for a project overview.
 - Tell me if something cannot work, and give me alternative approaches
 - Use `any` instead of `interface{}`
 - When generating test files, they should go into their own directory to avoid package name conflicts with the repo root directory
+- Checks against `time.Time` should use `time.Time.IsZero()`
 
 ### Generator Rules
 
