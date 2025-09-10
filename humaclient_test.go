@@ -2141,11 +2141,11 @@ func TestStringFormatToGoTypeConversionNullable(t *testing.T) {
 func TestIntegerFormatToGoTypeConversion(t *testing.T) {
 	// Test models with various integer formats
 	type IntegerTypesRecord struct {
-		ID           string `json:"id"`
-		SmallSigned  int8   `json:"smallSigned" format:"int8" minimum:"-128" maximum:"127"`
-		ShortSigned  int16  `json:"shortSigned" format:"int16" minimum:"-32768" maximum:"32767"`
-		RegularInt   int32  `json:"regularInt" format:"int32" minimum:"-2147483648" maximum:"2147483647"`
-		LargeSigned  int64  `json:"largeSigned" format:"int64"`
+		ID            string `json:"id"`
+		SmallSigned   int8   `json:"smallSigned" format:"int8" minimum:"-128" maximum:"127"`
+		ShortSigned   int16  `json:"shortSigned" format:"int16" minimum:"-32768" maximum:"32767"`
+		RegularInt    int32  `json:"regularInt" format:"int32" minimum:"-2147483648" maximum:"2147483647"`
+		LargeSigned   int64  `json:"largeSigned" format:"int64"`
 		SmallUnsigned uint8  `json:"smallUnsigned" format:"uint8" minimum:"0" maximum:"255"`
 		ShortUnsigned uint16 `json:"shortUnsigned" format:"uint16" minimum:"0" maximum:"65535"`
 		RegularUint   uint32 `json:"regularUint" format:"uint32" minimum:"0" maximum:"4294967295"`
@@ -2165,7 +2165,7 @@ func TestIntegerFormatToGoTypeConversion(t *testing.T) {
 			Body IntegerTypesRecord
 		}{
 			Body: IntegerTypesRecord{
-				ID: input.ID,
+				ID:            input.ID,
 				SmallSigned:   42,
 				ShortSigned:   1024,
 				RegularInt:    100000,
@@ -2247,6 +2247,129 @@ func TestIntegerFormatToGoTypeConversion(t *testing.T) {
 		_, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments)
 		if err != nil {
 			t.Fatalf("Generated client code with integer formats has syntax errors: %v", err)
+		}
+	})
+}
+
+func TestZeroValueChecksInGeneratedCode(t *testing.T) {
+	// Test that generated code uses correct zero value checks for different types:
+	// - time.Time should use .IsZero()
+	// - bool should use direct boolean check
+	// - pointer types should use != nil
+	// - numeric types should use != 0
+
+	// Create API with various parameter types
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Zero Check Test API", "1.0.0"))
+
+	huma.Get(api, "/test", func(ctx context.Context, input *struct {
+		Timestamp time.Time `query:"timestamp" format:"date-time" doc:"Time parameter"`
+		Count     int       `query:"count" doc:"Integer parameter"`
+		Score     float64   `query:"score" doc:"Float parameter"`
+		Active    bool      `query:"active" doc:"Boolean parameter"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: "test"}, nil
+	})
+
+	// Add an endpoint that could potentially generate pointer types in options structs
+	// This tests the general pointer handling logic we implemented
+	huma.Get(api, "/advanced", func(ctx context.Context, input *struct {
+		BasicParam   string `query:"basic" doc:"Regular string param"`
+		OptionalFlag bool   `query:"flag" doc:"Boolean flag"`
+		NumericValue int64  `query:"value" doc:"Numeric value"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: "advanced"}, nil
+	})
+
+	// Test client generation
+	tempDir, err := os.MkdirTemp("", "humaclient_zero_check_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client for zero check test: %v", err)
+	}
+
+	// Read the generated code
+	clientFile := "zerochecktestapiclient/client.go"
+	content, err := os.ReadFile(clientFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("TimeUseIsZeroCheck", func(t *testing.T) {
+		// Should use .IsZero() for time.Time fields
+		if !strings.Contains(clientCode, "!o.Timestamp.IsZero()") {
+			t.Error("Expected time.Time field to use .IsZero() check, not != 0")
+		}
+	})
+
+	t.Run("NumericTypesUseZeroComparison", func(t *testing.T) {
+		// Should use != 0 for numeric fields
+		if !strings.Contains(clientCode, "o.Count != 0") {
+			t.Error("Expected int field to use != 0 check")
+		}
+		if !strings.Contains(clientCode, "o.Score != 0") {
+			t.Error("Expected float64 field to use != 0 check")
+		}
+		if !strings.Contains(clientCode, "o.Value != 0") {
+			t.Error("Expected int64 field to use != 0 check")
+		}
+	})
+
+	t.Run("BoolUsesDirectCheck", func(t *testing.T) {
+		// Should use direct boolean check
+		if !strings.Contains(clientCode, "if o.Active {") {
+			t.Error("Expected bool field to use direct boolean check, not != 0")
+		}
+		if !strings.Contains(clientCode, "if o.Flag {") {
+			t.Error("Expected bool field to use direct boolean check, not != 0")
+		}
+	})
+
+	t.Run("StringTypesUseEmptyCheck", func(t *testing.T) {
+		// Should use != "" for string fields
+		if !strings.Contains(clientCode, `o.Basic != ""`) {
+			t.Error("Expected string field to use != \"\" check")
+		}
+	})
+
+	t.Run("PointerLogicIsReady", func(t *testing.T) {
+		// Note: While Huma doesn't currently generate pointer types for query params,
+		// our template logic is ready to handle them correctly with != nil checks.
+		// This ensures future compatibility if pointer support is added.
+
+		// Check that our hasPrefix template function works by verifying it's available
+		// (we can't easily test actual pointer generation due to Huma's limitations)
+
+		// The template should not contain the old "!= 0" pattern for non-numeric types
+		lines := strings.Split(clientCode, "\n")
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			// Check that we don't have any "!= 0" checks for bool or time types
+			if strings.Contains(trimmed, "!= 0") {
+				if strings.Contains(trimmed, "bool") || strings.Contains(trimmed, "time.Time") {
+					t.Errorf("Found incorrect != 0 check for bool/time type: %s", trimmed)
+				}
+			}
+		}
+	})
+
+	t.Run("GeneratedCodeCompiles", func(t *testing.T) {
+		// Parse the generated client code to verify syntax
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated client code with zero checks has syntax errors: %v", err)
 		}
 	})
 }

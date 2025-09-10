@@ -170,6 +170,7 @@ func generateClientCode(openapi *huma.OpenAPI, packageName string, opts Options)
 		"lower":      strings.ToLower,
 		"trimPrefix": strings.TrimPrefix,
 		"trimSuffix": strings.TrimSuffix,
+		"hasPrefix":  strings.HasPrefix,
 		"eq": func(a, b any) bool {
 			return a == b
 		},
@@ -1129,6 +1130,12 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 {{- range .OptionsFields}}
 {{- if eq .Type "string"}}
 	if o.{{.Name}} != "" {
+{{- else if eq .Type "bool"}}
+	if o.{{.Name}} {
+{{- else if eq .Type "time.Time"}}
+	if !o.{{.Name}}.IsZero() {
+{{- else if hasPrefix .Type "*"}}
+	if o.{{.Name}} != nil {
 {{- else}}
 	if o.{{.Name}} != 0 {
 {{- end}}
