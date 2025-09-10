@@ -55,23 +55,24 @@ type FieldData struct {
 
 // OperationData represents an API operation for code generation
 type OperationData struct {
-	MethodName        string
-	HTTPMethod        string
-	Path              string
-	PathParams        []ParamData
-	HasRequestBody    bool
-	RequestBodyType   string
-	HasOptionalBody   bool
-	ReturnType        string
-	ZeroValue         string
-	HasQueryParams    bool
-	HasHeaderParams   bool
-	QueryParams       []ParamData
-	HeaderParams      []ParamData
-	OptionsStructName string
-	OptionsFields     []OptionField
-	IsPaginated       bool
-	ItemType          string
+	MethodName         string
+	HTTPMethod         string
+	Path               string
+	PathParams         []ParamData
+	HasRequestBody     bool
+	RequestBodyType    string
+	HasOptionalBody    bool
+	HasResponseBody    bool
+	ReturnType         string
+	ZeroValue          string
+	HasQueryParams     bool
+	HasHeaderParams    bool
+	QueryParams        []ParamData
+	HeaderParams       []ParamData
+	OptionsStructName  string
+	OptionsFields      []OptionField
+	IsPaginated        bool
+	ItemType           string
 }
 
 // ParamData represents a parameter
@@ -533,19 +534,6 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 				continue
 			}
 
-			// Check if operation returns JSON
-			hasJSONResponse := false
-			for _, response := range operation.Responses {
-				if response.Content != nil && response.Content["application/json"] != nil {
-					hasJSONResponse = true
-					break
-				}
-			}
-
-			if !hasJSONResponse {
-				continue
-			}
-
 			opData := OperationData{
 				MethodName: generateMethodName(operation),
 				HTTPMethod: method,
@@ -563,7 +551,7 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 			}
 
 			// Handle return type
-			opData.ReturnType, opData.ZeroValue = generateReturnType(operation, openapi, allowedPackages, externalImports)
+			opData.ReturnType, opData.ZeroValue, opData.HasResponseBody = generateReturnType(operation, openapi, allowedPackages, externalImports)
 
 			// Check for pagination support
 			if isPaginatedOperation(operation, openapi) {
@@ -755,16 +743,23 @@ func generateMethodName(operation *huma.Operation) string {
 }
 
 // generateReturnType generates the return type for an operation method
-func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) (string, string) {
+func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) (string, string, bool) {
 	// Find the success response (200, 201, etc.)
 	var responseSchema *huma.Schema
+	hasResponseBody := false
 	for statusCode, response := range operation.Responses {
 		if statusCode[0] == '2' && response.Content != nil {
 			if jsonContent := response.Content["application/json"]; jsonContent != nil {
 				responseSchema = jsonContent.Schema
+				hasResponseBody = true
 				break
 			}
 		}
+	}
+
+	if !hasResponseBody {
+		// No response body, return only (*http.Response, error)
+		return "(*http.Response, error)", "", false
 	}
 
 	responseType := "any"
@@ -775,7 +770,7 @@ func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowe
 	zeroValue := getZeroValue(responseType)
 	returnType := fmt.Sprintf("(*http.Response, %s, error)", responseType)
 
-	return returnType, zeroValue
+	return returnType, zeroValue, true
 }
 
 // extractPathParams extracts parameter names from a path template
@@ -1215,7 +1210,11 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 
 	u, err := url.Parse(c.baseURL + pathTemplate)
 	if err != nil {
+{{- if .HasResponseBody}}
 		return nil, {{.ZeroValue}}, fmt.Errorf("invalid URL: %w", err)
+{{- else}}
+		return nil, fmt.Errorf("invalid URL: %w", err)
+{{- end}}
 	}
 
 	// Apply query parameters
@@ -1226,14 +1225,22 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- if .HasRequestBody}}
 	jsonData, err := json.Marshal(body)
 	if err != nil {
+{{- if .HasResponseBody}}
 		return nil, {{.ZeroValue}}, fmt.Errorf("failed to marshal request body: %w", err)
+{{- else}}
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+{{- end}}
 	}
 	reqBody = bytes.NewReader(jsonData)
 {{- else if .HasOptionalBody}}
 	if reqOpts.Body != nil {
 		jsonData, err := json.Marshal(reqOpts.Body)
 		if err != nil {
+{{- if .HasResponseBody}}
 			return nil, {{.ZeroValue}}, fmt.Errorf("failed to marshal request body: %w", err)
+{{- else}}
+			return nil, fmt.Errorf("failed to marshal request body: %w", err)
+{{- end}}
 		}
 		reqBody = bytes.NewReader(jsonData)
 	}
@@ -1242,7 +1249,11 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, "{{.HTTPMethod}}", u.String(), reqBody)
 	if err != nil {
+{{- if .HasResponseBody}}
 		return nil, {{.ZeroValue}}, fmt.Errorf("failed to create request: %w", err)
+{{- else}}
+		return nil, fmt.Errorf("failed to create request: %w", err)
+{{- end}}
 	}
 
 	// Set content type and apply custom headers
@@ -1256,16 +1267,25 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+{{- if .HasResponseBody}}
 		return nil, {{.ZeroValue}}, fmt.Errorf("request failed: %w", err)
+{{- else}}
+		return nil, fmt.Errorf("request failed: %w", err)
+{{- end}}
 	}
 	defer resp.Body.Close()
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
+{{- if .HasResponseBody}}
 		return resp, {{.ZeroValue}}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+{{- else}}
+		return resp, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+{{- end}}
 	}
 
+{{- if .HasResponseBody}}
 	// Parse response body
 	var result {{trimPrefix (trimSuffix .ReturnType ", error)") "(*http.Response, "}}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -1273,6 +1293,9 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 	}
 
 	return resp, result, nil
+{{- else}}
+	return resp, nil
+{{- end}}
 }
 {{end}}
 
