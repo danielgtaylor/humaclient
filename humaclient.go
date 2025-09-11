@@ -230,14 +230,17 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 
 	sort.Strings(data.Imports)
 
+	// Determine the current package import path from the output directory
+	currentPkgPath := determineCurrentPackagePath(outputDir)
+
 	// Generate schemas
 	externalImports := make(map[string]bool)
-	if err := buildSchemas(&data.Schemas, openapi, opts.AllowedPackages, externalImports); err != nil {
+	if err := buildSchemas(&data.Schemas, openapi, opts.AllowedPackages, externalImports, currentPkgPath); err != nil {
 		return nil, fmt.Errorf("failed to build schemas: %w", err)
 	}
 
 	// Generate operations
-	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi, opts.AllowedPackages, externalImports); err != nil {
+	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi, opts.AllowedPackages, externalImports, currentPkgPath); err != nil {
 		return nil, fmt.Errorf("failed to build operations: %w", err)
 	}
 
@@ -256,9 +259,6 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 		delete(externalImports, pkg)
 	}
 	sort.Strings(data.Imports)
-
-	// Determine the current package import path from the output directory
-	currentPkgPath := determineCurrentPackagePath(outputDir)
 
 	// Add external imports to the imports list, excluding self-imports
 	for pkg := range externalImports {
@@ -341,7 +341,7 @@ func findGoModule(startDir string) (moduleRoot, modulePath string) {
 }
 
 // buildSchemas generates schema data from OpenAPI components
-func buildSchemas(schemas *[]SchemaData, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
+func buildSchemas(schemas *[]SchemaData, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
 	if openapi.Components == nil || openapi.Components.Schemas == nil {
 		return nil
 	}
@@ -352,7 +352,7 @@ func buildSchemas(schemas *[]SchemaData, openapi *huma.OpenAPI, allowedPackages 
 	for _, name := range names {
 		schema := schemaMap[name]
 		if schema.Type == "object" {
-			schemaData, err := createSchemaData(name, schema, openapi, allowedPackages, externalImports)
+			schemaData, err := createSchemaData(name, schema, openapi, allowedPackages, externalImports, currentPkgPath)
 			if err != nil {
 				return fmt.Errorf("failed to create schema data for %s: %w", name, err)
 			}
@@ -374,7 +374,7 @@ func getSortedKeys(schemaMap map[string]*huma.Schema) []string {
 }
 
 // createSchemaData creates a SchemaData from a schema name and definition
-func createSchemaData(name string, schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) (SchemaData, error) {
+func createSchemaData(name string, schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) (SchemaData, error) {
 	schemaData := SchemaData{
 		Name:       name,
 		StructName: casing.Camel(name, casing.Initialism),
@@ -388,7 +388,7 @@ func createSchemaData(name string, schema *huma.Schema, openapi *huma.OpenAPI, a
 		externalImports[pkg] = true
 	} else {
 		// Only build fields for internal types
-		if err := buildFields(&schemaData.Fields, schema, openapi, allowedPackages, externalImports); err != nil {
+		if err := buildFields(&schemaData.Fields, schema, openapi, allowedPackages, externalImports, currentPkgPath); err != nil {
 			return schemaData, err
 		}
 	}
@@ -439,7 +439,7 @@ func getExternalPackageAndType(openapi *huma.OpenAPI, schemaName string, allowed
 }
 
 // buildFields generates field data from schema properties
-func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
+func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
 	if schema.Properties == nil {
 		return nil
 	}
@@ -452,7 +452,7 @@ func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI
 		}
 
 		propSchema := schema.Properties[propName]
-		field := createFieldData(propName, propSchema, schema, openapi, allowedPackages, externalImports)
+		field := createFieldData(propName, propSchema, schema, openapi, allowedPackages, externalImports, currentPkgPath)
 		*fields = append(*fields, field)
 	}
 
@@ -470,11 +470,11 @@ func getSortedPropertyNames(properties map[string]*huma.Schema) []string {
 }
 
 // createFieldData creates a FieldData from property information
-func createFieldData(propName string, propSchema, parentSchema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) FieldData {
+func createFieldData(propName string, propSchema, parentSchema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) FieldData {
 	fieldName := casing.Camel(propName, casing.Initialism)
 	isFieldNullable := !isRequired(parentSchema, propName)
 	usePointer := isFieldNullable || isCircularReference(propSchema, parentSchema, openapi)
-	goType := schemaToGoTypeWithNullability(propSchema, openapi, usePointer, allowedPackages, externalImports)
+	goType := schemaToGoTypeWithNullability(propSchema, openapi, usePointer, allowedPackages, externalImports, currentPkgPath)
 
 	jsonTag := propName
 	if isFieldNullable {
@@ -592,7 +592,7 @@ func buildHumaTags(schema *huma.Schema) string {
 }
 
 // buildOperations generates operation data from OpenAPI paths
-func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
+func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
 	allOptions := make(map[string]OptionField)
 
 	paths := getSortedPaths(openapi.Paths)
@@ -605,7 +605,7 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 				continue
 			}
 
-			opData, err := createOperationData(operation, method, path, openapi, allowedPackages, externalImports, allOptions)
+			opData, err := createOperationData(operation, method, path, openapi, allowedPackages, externalImports, allOptions, currentPkgPath)
 			if err != nil {
 				return fmt.Errorf("failed to create operation data for %s %s: %w", method, path, err)
 			}
@@ -654,7 +654,7 @@ func getOperationForMethod(pathItem *huma.PathItem, method string) *huma.Operati
 }
 
 // createOperationData creates an OperationData from operation details
-func createOperationData(operation *huma.Operation, method, path string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, allOptions map[string]OptionField) (OperationData, error) {
+func createOperationData(operation *huma.Operation, method, path string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, allOptions map[string]OptionField, currentPkgPath string) (OperationData, error) {
 	opData := OperationData{
 		MethodName: generateMethodName(operation),
 		HTTPMethod: method,
@@ -663,16 +663,16 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 	}
 
 	// Handle request body
-	handleRequestBody(&opData, operation, openapi, allowedPackages, externalImports)
+	handleRequestBody(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath)
 
 	// Handle return type
-	opData.ReturnType, opData.ZeroValue, opData.HasResponseBody = generateReturnType(operation, openapi, allowedPackages, externalImports)
+	opData.ReturnType, opData.ZeroValue, opData.HasResponseBody = generateReturnType(operation, openapi, allowedPackages, externalImports, currentPkgPath)
 
 	// Check for pagination support
-	handlePagination(&opData, operation, openapi, allowedPackages, externalImports)
+	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath)
 
 	// Handle parameters
-	if err := buildOperationParams(&opData, operation, allOptions, openapi, allowedPackages, externalImports); err != nil {
+	if err := buildOperationParams(&opData, operation, allOptions, openapi, allowedPackages, externalImports, currentPkgPath); err != nil {
 		return opData, err
 	}
 
@@ -680,18 +680,18 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 }
 
 // handleRequestBody processes request body for operation data
-func handleRequestBody(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) {
+func handleRequestBody(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) {
 	if operation.RequestBody != nil && operation.RequestBody.Content != nil {
 		if jsonContent := operation.RequestBody.Content["application/json"]; jsonContent != nil {
 			opData.HasRequestBody = true
-			opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi, allowedPackages, externalImports)
+			opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi, allowedPackages, externalImports, currentPkgPath)
 			opData.HasOptionalBody = !operation.RequestBody.Required
 		}
 	}
 }
 
 // handlePagination processes pagination info for operation data
-func handlePagination(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) {
+func handlePagination(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) {
 	if isPaginatedOperation(operation, openapi) {
 		opData.IsPaginated = true
 		// Extract item type from array return type
@@ -699,7 +699,7 @@ func handlePagination(opData *OperationData, operation *huma.Operation, openapi 
 			if statusCode[0] == '2' && response.Content != nil {
 				if jsonContent := response.Content["application/json"]; jsonContent != nil {
 					if jsonContent.Schema != nil && jsonContent.Schema.Type == "array" && jsonContent.Schema.Items != nil {
-						opData.ItemType = schemaToGoType(jsonContent.Schema.Items, openapi, allowedPackages, externalImports)
+						opData.ItemType = schemaToGoType(jsonContent.Schema.Items, openapi, allowedPackages, externalImports, currentPkgPath)
 						return
 					}
 				}
@@ -709,13 +709,13 @@ func handlePagination(opData *OperationData, operation *huma.Operation, openapi 
 }
 
 // buildOperationParams builds parameter data for an operation
-func buildOperationParams(opData *OperationData, operation *huma.Operation, allOptions map[string]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) error {
+func buildOperationParams(opData *OperationData, operation *huma.Operation, allOptions map[string]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
 	if operation.Parameters == nil {
 		return nil
 	}
 
 	for _, param := range operation.Parameters {
-		paramData := createParamData(param, openapi, allowedPackages, externalImports)
+		paramData := createParamData(param, openapi, allowedPackages, externalImports, currentPkgPath)
 
 		switch param.In {
 		case "query":
@@ -739,7 +739,7 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, allO
 }
 
 // createParamData creates a ParamData from a huma parameter
-func createParamData(param *huma.Param, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) ParamData {
+func createParamData(param *huma.Param, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) ParamData {
 	paramData := ParamData{
 		Name:             param.Name,
 		GoName:           casing.Camel(param.Name, casing.Initialism),
@@ -749,7 +749,7 @@ func createParamData(param *huma.Param, openapi *huma.OpenAPI, allowedPackages [
 	}
 
 	if param.Schema != nil {
-		paramData.Type = schemaToGoType(param.Schema, openapi, allowedPackages, externalImports)
+		paramData.Type = schemaToGoType(param.Schema, openapi, allowedPackages, externalImports, currentPkgPath)
 	}
 
 	return paramData
@@ -859,7 +859,7 @@ func generateMethodName(operation *huma.Operation) string {
 }
 
 // generateReturnType generates the return type for an operation method
-func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) (string, string, bool) {
+func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) (string, string, bool) {
 	// Find the success response (200, 201, etc.)
 	var responseSchema *huma.Schema
 	hasResponseBody := false
@@ -880,7 +880,7 @@ func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowe
 
 	responseType := "any"
 	if responseSchema != nil {
-		responseType = schemaToGoType(responseSchema, openapi, allowedPackages, externalImports)
+		responseType = schemaToGoType(responseSchema, openapi, allowedPackages, externalImports, currentPkgPath)
 	}
 
 	zeroValue := getZeroValue(responseType)
@@ -949,15 +949,15 @@ func isRequired(schema *huma.Schema, propName string) bool {
 }
 
 // schemaToGoType converts an OpenAPI schema type to a Go type
-func schemaToGoType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) string {
-	return schemaToGoTypeWithNullability(schema, openapi, false, allowedPackages, externalImports)
+func schemaToGoType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) string {
+	return schemaToGoTypeWithNullability(schema, openapi, false, allowedPackages, externalImports, currentPkgPath)
 }
 
 // schemaToGoTypeWithNullability converts an OpenAPI schema type to a Go type with optional nullability
-func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, isNullable bool, allowedPackages []string, externalImports map[string]bool) string {
+func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, isNullable bool, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) string {
 	// Handle references first
 	if schema.Ref != "" {
-		return handleReference(schema.Ref, openapi, allowedPackages, externalImports, isNullable)
+		return handleReference(schema.Ref, openapi, allowedPackages, externalImports, isNullable, currentPkgPath)
 	}
 
 	switch schema.Type {
@@ -970,9 +970,9 @@ func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, i
 	case "boolean":
 		return "bool"
 	case "array":
-		return handleArrayType(schema, openapi, allowedPackages, externalImports)
+		return handleArrayType(schema, openapi, allowedPackages, externalImports, currentPkgPath)
 	case "object":
-		return handleObjectType(schema, openapi, allowedPackages, externalImports, isNullable)
+		return handleObjectType(schema, openapi, allowedPackages, externalImports, isNullable, currentPkgPath)
 	default:
 		return "any"
 	}
@@ -1026,24 +1026,24 @@ func handleNumberType(format string) string {
 }
 
 // handleArrayType handles array type conversions
-func handleArrayType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool) string {
+func handleArrayType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) string {
 	if schema.Items != nil {
-		itemType := schemaToGoType(schema.Items, openapi, allowedPackages, externalImports)
+		itemType := schemaToGoType(schema.Items, openapi, allowedPackages, externalImports, currentPkgPath)
 		return "[]" + itemType
 	}
 	return "[]any"
 }
 
 // handleObjectType handles object type conversions
-func handleObjectType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, isNullable bool) string {
+func handleObjectType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, isNullable bool, currentPkgPath string) string {
 	if schema.Ref != "" {
-		return handleReference(schema.Ref, openapi, allowedPackages, externalImports, isNullable)
+		return handleReference(schema.Ref, openapi, allowedPackages, externalImports, isNullable, currentPkgPath)
 	}
 	return "map[string]any"
 }
 
 // handleReference handles schema references
-func handleReference(ref string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, isNullable bool) string {
+func handleReference(ref string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, isNullable bool, currentPkgPath string) string {
 	parts := strings.Split(ref, "/")
 	if len(parts) == 0 {
 		return "any"
@@ -1058,6 +1058,17 @@ func handleReference(ref string, openapi *huma.OpenAPI, allowedPackages []string
 	// Check if this is an external type
 	pkg, extTypeName := getExternalPackageAndType(openapi, refName, allowedPackages)
 	if pkg != "" {
+		// Check if this is a self-import (the external package is the current package)
+		if pkg == currentPkgPath {
+			// Use local type name without qualification since it's in the same package
+			typeName := casing.Camel(refName, casing.Initialism)
+			if isNullable {
+				return "*" + typeName
+			}
+			return typeName
+		}
+
+		// External type from a different package
 		externalImports[pkg] = true
 		if isNullable {
 			return "*" + extTypeName
