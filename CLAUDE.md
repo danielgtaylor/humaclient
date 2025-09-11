@@ -16,6 +16,7 @@ See @README.md for a project overview.
 - Simple is better than complex
 - Developer experience of the generated SDK is important
 - Generated code should be standalone without any dependencies. The code generator can use dependencies.
+- Generated code _must_ be stable, producing minimal diffs when regenerated
 - Write tests for all new features and added code, and check for reasonable coverage
 - Changes should not break existing users
 - Tell me if something cannot work, and give me alternative approaches
