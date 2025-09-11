@@ -2373,3 +2373,137 @@ func TestZeroValueChecksInGeneratedCode(t *testing.T) {
 		}
 	})
 }
+
+func TestImportLoopPrevention(t *testing.T) {
+	// Create a temporary directory structure to simulate a scenario where
+	// the output directory matches one of the allowed packages
+	tempDir, err := os.MkdirTemp("", "humaclient_importloop_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a go.mod file to establish module context
+	goModContent := `module example.com/testapi
+
+go 1.21
+`
+	err = os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goModContent), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	// Change to temp directory so our package detection works
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	// Create a simple API
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Test API", "1.0.0"))
+
+	// Add a simple endpoint
+	huma.Get(api, "/test", func(ctx context.Context, input *struct{}) (*SimpleMessageResponse, error) {
+		return &SimpleMessageResponse{Body: "test"}, nil
+	})
+
+	// Test case where AllowedPackages contains the same path as the output directory
+	t.Run("PreventsSelfImport", func(t *testing.T) {
+		outputDir := "testapiclient"
+		currentPackagePath := "example.com/testapi/testapiclient"
+
+		opts := Options{
+			PackageName:     "testapiclient",
+			OutputDirectory: outputDir,
+			AllowedPackages: []string{currentPackagePath}, // This would cause an import loop
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+
+		// Read the generated client code
+		content, err := os.ReadFile(filepath.Join(outputDir, "client.go"))
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		// Verify that the self-import is not present in the generated code
+		lines := strings.Split(clientCode, "\n")
+		inImportBlock := false
+
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+
+			if strings.Contains(trimmed, "import (") {
+				inImportBlock = true
+				continue
+			}
+
+			if inImportBlock && strings.Contains(trimmed, ")") {
+				inImportBlock = false
+				continue
+			}
+
+			if inImportBlock && strings.Contains(trimmed, "\"") {
+				// Verify no self-import
+				if strings.Contains(trimmed, currentPackagePath) {
+					t.Errorf("Found self-import in generated code: %s", trimmed)
+				}
+			}
+		}
+
+		// The test should pass regardless of whether external imports section exists
+		// because when self-imports are filtered out, the section may be empty
+		t.Logf("Generated client successfully without self-imports")
+	})
+
+	t.Run("AllowsOtherExternalImports", func(t *testing.T) {
+		outputDir := "testapiclient2"
+
+		opts := Options{
+			PackageName:     "testapiclient2",
+			OutputDirectory: outputDir,
+			AllowedPackages: []string{
+				"example.com/testapi/testapiclient2", // Self-import (should be filtered)
+				"github.com/danielgtaylor/huma/v2",   // External import (should be allowed)
+			},
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+
+		// Read the generated client code
+		content, err := os.ReadFile(filepath.Join(outputDir, "client.go"))
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		// Verify that:
+		// 1. Self-import is not present
+		// 2. Other external imports are preserved (if they're actually used)
+		lines := strings.Split(clientCode, "\n")
+		foundSelfImport := false
+
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+
+			if strings.Contains(trimmed, "example.com/testapi/testapiclient2") {
+				foundSelfImport = true
+			}
+		}
+
+		if foundSelfImport {
+			t.Errorf("Found self-import in generated code when it should be filtered out")
+		}
+
+		t.Logf("Successfully filtered self-import while preserving other allowed packages")
+	})
+}

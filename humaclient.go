@@ -137,7 +137,7 @@ func GenerateClientWithOptions(api huma.API, opts Options) error {
 	}
 
 	// Generate client code
-	code, err := generateClientCode(openapi, packageName, opts)
+	code, err := generateClientCode(openapi, packageName, outputDir, opts)
 	if err != nil {
 		return fmt.Errorf("failed to generate client code: %w", err)
 	}
@@ -162,8 +162,8 @@ func LowerCamel(value string, transform ...casing.TransformFunc) string {
 }
 
 // generateClientCode generates the complete client code for an OpenAPI specification
-func generateClientCode(openapi *huma.OpenAPI, packageName string, opts Options) ([]byte, error) {
-	data, err := buildTemplateData(openapi, packageName, opts)
+func generateClientCode(openapi *huma.OpenAPI, packageName string, outputDir string, opts Options) ([]byte, error) {
+	data, err := buildTemplateData(openapi, packageName, outputDir, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build template data: %w", err)
 	}
@@ -197,7 +197,7 @@ func generateClientCode(openapi *huma.OpenAPI, packageName string, opts Options)
 }
 
 // buildTemplateData builds the data structure for template execution
-func buildTemplateData(openapi *huma.OpenAPI, packageName string, opts Options) (*ClientTemplateData, error) {
+func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir string, opts Options) (*ClientTemplateData, error) {
 	// Generate client interface name from options or API title
 	clientInterfaceName := opts.ClientName
 	if clientInterfaceName == "" {
@@ -257,13 +257,87 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, opts Options) 
 	}
 	sort.Strings(data.Imports)
 
-	// Add external imports to the imports list
+	// Determine the current package import path from the output directory
+	currentPkgPath := determineCurrentPackagePath(outputDir)
+
+	// Add external imports to the imports list, excluding self-imports
 	for pkg := range externalImports {
-		data.ExternalImports = append(data.ExternalImports, "\""+pkg+"\"")
+		// Skip imports that would create a circular reference to the current package
+		if pkg != currentPkgPath {
+			data.ExternalImports = append(data.ExternalImports, "\""+pkg+"\"")
+		}
 	}
 	sort.Strings(data.ExternalImports)
 
 	return data, nil
+}
+
+// determineCurrentPackagePath attempts to determine the import path for the current package
+// based on the output directory
+func determineCurrentPackagePath(outputDir string) string {
+	// Convert output directory to absolute path
+	absPath, err := filepath.Abs(outputDir)
+	if err != nil {
+		return ""
+	}
+
+	// Try to find the current working directory and determine the module root
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+
+	// Look for go.mod file to determine module root and module path
+	moduleRoot, modulePath := findGoModule(wd)
+	if moduleRoot == "" || modulePath == "" {
+		return ""
+	}
+
+	// Calculate relative path from module root to output directory
+	relPath, err := filepath.Rel(moduleRoot, absPath)
+	if err != nil {
+		return ""
+	}
+
+	// Construct the full import path
+	if relPath == "." {
+		return modulePath
+	}
+	return modulePath + "/" + filepath.ToSlash(relPath)
+}
+
+// findGoModule walks up the directory tree to find go.mod and extract module path
+func findGoModule(startDir string) (moduleRoot, modulePath string) {
+	dir := startDir
+	for {
+		goModPath := filepath.Join(dir, "go.mod")
+		if _, err := os.Stat(goModPath); err == nil {
+			// Found go.mod, read module path
+			content, err := os.ReadFile(goModPath)
+			if err != nil {
+				return "", ""
+			}
+
+			// Parse module directive (first line typically: "module path/to/module")
+			lines := strings.Split(string(content), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "module ") {
+					modulePath := strings.TrimSpace(strings.TrimPrefix(line, "module"))
+					return dir, modulePath
+				}
+			}
+			return dir, ""
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached root directory
+			break
+		}
+		dir = parent
+	}
+	return "", ""
 }
 
 // buildSchemas generates schema data from OpenAPI components
