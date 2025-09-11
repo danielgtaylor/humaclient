@@ -200,7 +200,6 @@ func (c *ExampleAPIClientImpl) ListThings(ctx context.Context, opts ...Option) (
 		body, _ := io.ReadAll(resp.Body)
 		return resp, nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
-
 	// Parse response body
 	var result []Thing
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -254,7 +253,6 @@ func (c *ExampleAPIClientImpl) GetThingsByID(ctx context.Context, id string, opt
 		body, _ := io.ReadAll(resp.Body)
 		return resp, Thing{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
-
 	// Parse response body
 	var result Thing
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
