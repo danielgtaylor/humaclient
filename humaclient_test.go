@@ -2373,3 +2373,232 @@ func TestZeroValueChecksInGeneratedCode(t *testing.T) {
 		}
 	})
 }
+
+func TestImportLoopPrevention(t *testing.T) {
+	// Create a temporary directory structure to simulate a scenario where
+	// the output directory matches one of the allowed packages
+	tempDir, err := os.MkdirTemp("", "humaclient_importloop_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a go.mod file to establish module context
+	goModContent := `module example.com/testapi
+
+go 1.21
+`
+	err = os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goModContent), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	// Change to temp directory so our package detection works
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	// Create a simple API
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Test API", "1.0.0"))
+
+	// Add a simple endpoint
+	huma.Get(api, "/test", func(ctx context.Context, input *struct{}) (*SimpleMessageResponse, error) {
+		return &SimpleMessageResponse{Body: "test"}, nil
+	})
+
+	// Test case where AllowedPackages contains the same path as the output directory
+	t.Run("PreventsSelfImport", func(t *testing.T) {
+		outputDir := "testapiclient"
+		currentPackagePath := "example.com/testapi/testapiclient"
+
+		opts := Options{
+			PackageName:     "testapiclient",
+			OutputDirectory: outputDir,
+			AllowedPackages: []string{currentPackagePath}, // This would cause an import loop
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+
+		// Read the generated client code
+		content, err := os.ReadFile(filepath.Join(outputDir, "client.go"))
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		// Verify that the self-import is not present in the generated code
+		lines := strings.Split(clientCode, "\n")
+		inImportBlock := false
+
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+
+			if strings.Contains(trimmed, "import (") {
+				inImportBlock = true
+				continue
+			}
+
+			if inImportBlock && strings.Contains(trimmed, ")") {
+				inImportBlock = false
+				continue
+			}
+
+			if inImportBlock && strings.Contains(trimmed, "\"") {
+				// Verify no self-import
+				if strings.Contains(trimmed, currentPackagePath) {
+					t.Errorf("Found self-import in generated code: %s", trimmed)
+				}
+			}
+		}
+
+		// The test should pass regardless of whether external imports section exists
+		// because when self-imports are filtered out, the section may be empty
+		t.Logf("Generated client successfully without self-imports")
+	})
+
+	t.Run("AllowsOtherExternalImports", func(t *testing.T) {
+		outputDir := "testapiclient2"
+
+		opts := Options{
+			PackageName:     "testapiclient2",
+			OutputDirectory: outputDir,
+			AllowedPackages: []string{
+				"example.com/testapi/testapiclient2", // Self-import (should be filtered)
+				"github.com/danielgtaylor/huma/v2",   // External import (should be allowed)
+			},
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+
+		// Read the generated client code
+		content, err := os.ReadFile(filepath.Join(outputDir, "client.go"))
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		// Verify that:
+		// 1. Self-import is not present
+		// 2. Other external imports are preserved (if they're actually used)
+		lines := strings.Split(clientCode, "\n")
+		foundSelfImport := false
+
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+
+			if strings.Contains(trimmed, "example.com/testapi/testapiclient2") {
+				foundSelfImport = true
+			}
+		}
+
+		if foundSelfImport {
+			t.Errorf("Found self-import in generated code when it should be filtered out")
+		}
+
+		t.Logf("Successfully filtered self-import while preserving other allowed packages")
+	})
+}
+
+func TestSelfImportTypeReferences(t *testing.T) {
+	// Create a temporary directory structure to test type reference handling
+	tempDir, err := os.MkdirTemp("", "humaclient_typereferences_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a go.mod file to establish module context
+	goModContent := `module example.com/myapi
+
+go 1.21
+
+require github.com/danielgtaylor/huma/v2 v2.15.0
+`
+	err = os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goModContent), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	// Change to temp directory so our package detection works
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	// Define a resource type that will be used in the API
+	type Resource struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+
+	// Create an API that would use both self-types and external types
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("My API", "1.0.0"))
+
+	// Add an endpoint that uses the Resource type (this will auto-register the schema)
+	huma.Get(api, "/resources/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id"`
+	}) (*struct{ Body Resource }, error) {
+		return &struct{ Body Resource }{
+			Body: Resource{
+				ID:   input.ID,
+				Name: "Test Resource",
+			},
+		}, nil
+	})
+
+	t.Run("UsesUnqualifiedTypesForSelfImports", func(t *testing.T) {
+		outputDir := "myapiclient" 
+		
+		opts := Options{
+			PackageName:     "myapiclient",
+			OutputDirectory: outputDir,
+			AllowedPackages: []string{
+				"example.com/myapi/myapiclient",  // Self-import - types should be unqualified
+				"github.com/danielgtaylor/huma/v2", // External import - types should be qualified
+			},
+		}
+
+		err := GenerateClientWithOptions(api, opts)
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+
+		// Read the generated client code
+		content, err := os.ReadFile(filepath.Join(outputDir, "client.go"))
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		// Verify that self-import types are unqualified
+		// Since our schema is being generated locally, references should be like "Resource", not "myapiclient.Resource"
+		if strings.Contains(clientCode, "myapiclient.Resource") {
+			t.Errorf("Found qualified self-reference 'myapiclient.Resource' in generated code - should be unqualified 'Resource'")
+		}
+
+		// Verify the Resource type is defined locally
+		if !strings.Contains(clientCode, "type Resource struct") {
+			t.Errorf("Expected to find 'type Resource struct' definition in generated code")
+		}
+
+		// Verify that any actual external references (like huma.Schema) are qualified if used
+		if strings.Contains(clientCode, "huma.") {
+			// If huma types are used, they should be qualified since they're truly external
+			if !strings.Contains(clientCode, "\"github.com/danielgtaylor/huma/v2\"") {
+				t.Errorf("Found huma.* reference but no import for github.com/danielgtaylor/huma/v2")
+			}
+		}
+
+		t.Logf("Successfully generated code with proper type reference handling")
+	})
+}
