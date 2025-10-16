@@ -1,6 +1,6 @@
 module github.com/danielgtaylor/humaclient
 
-go 1.25.0
+go 1.23.0
 
 require (
 	github.com/danielgtaylor/casing v0.0.0-20210126043903-4e55e6373ac3
