@@ -6,6 +6,7 @@ import (
 	"go/format"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -15,12 +16,30 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 )
 
+// PaginationOptions configures how wrapped list responses are paginated.
+// When set on Options, the generator will detect object responses containing
+// an array field and generate paginator methods that iterate through items.
+type PaginationOptions struct {
+	// ItemsField is the Go struct field name in the response object that
+	// contains the array of items (e.g. "Items", "Data", "Results").
+	// Must be a root-level field.
+	ItemsField string
+
+	// NextField is the Go struct field path in the response object that
+	// contains the URL for the next page. Supports dot-separated paths for
+	// nested fields (e.g. "Next", "Meta.Next", "Pagination.NextURL").
+	// Optional. When set, enables body-based pagination in addition to or
+	// instead of Link header pagination.
+	NextField string
+}
+
 // Options provides customization options for client generation
 type Options struct {
-	PackageName     string   // Custom package name (default: generated from API title)
-	ClientName      string   // Custom client interface name (default: generated from API title)
-	AllowedPackages []string // List of allowed Go packages that can be referenced instead of recreated
-	OutputDirectory string   // Custom output directory (default: package name in current directory)
+	PackageName     string             // Custom package name (default: generated from API title)
+	ClientName      string             // Custom client interface name (default: generated from API title)
+	AllowedPackages []string           // List of allowed Go packages that can be referenced instead of recreated
+	OutputDirectory string             // Custom output directory (default: package name in current directory)
+	Pagination      *PaginationOptions // Pagination options for object-wrapped list responses
 }
 
 // ClientTemplateData holds data for client code generation
@@ -73,6 +92,9 @@ type OperationData struct {
 	OptionsFields     []OptionField
 	IsPaginated       bool
 	ItemType          string
+	ItemsField        string // Go struct field name for items array in wrapped responses (e.g. "Items")
+	NextField         string // Go struct field path for next-page URL (e.g. "Next" or "Meta.Next")
+	ResponseType      string // Wrapper struct type name for object-wrapped paginated responses
 }
 
 // ParamData represents a parameter
@@ -224,7 +246,7 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 	}
 
 	// Add iter import if we have paginated operations
-	if hasPaginatedOperations(openapi) {
+	if hasPaginatedOperations(openapi, opts.Pagination) {
 		data.Imports = append(data.Imports, "\"iter\"")
 	}
 
@@ -240,7 +262,7 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 	}
 
 	// Generate operations
-	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi, opts.AllowedPackages, externalImports, currentPkgPath); err != nil {
+	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi, opts.AllowedPackages, externalImports, currentPkgPath, opts.Pagination); err != nil {
 		return nil, fmt.Errorf("failed to build operations: %w", err)
 	}
 
@@ -388,7 +410,7 @@ func createSchemaData(name string, schema *huma.Schema, openapi *huma.OpenAPI, a
 		externalImports[pkg] = true
 	} else {
 		// Only build fields for internal types
-		if err := buildFields(&schemaData.Fields, schema, openapi, allowedPackages, externalImports, currentPkgPath); err != nil {
+		if err := buildFields(&schemaData.Fields, name, schema, openapi, allowedPackages, externalImports, currentPkgPath); err != nil {
 			return schemaData, err
 		}
 	}
@@ -439,7 +461,7 @@ func getExternalPackageAndType(openapi *huma.OpenAPI, schemaName string, allowed
 }
 
 // buildFields generates field data from schema properties
-func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
+func buildFields(fields *[]FieldData, parentSchemaName string, schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
 	if schema.Properties == nil {
 		return nil
 	}
@@ -452,7 +474,7 @@ func buildFields(fields *[]FieldData, schema *huma.Schema, openapi *huma.OpenAPI
 		}
 
 		propSchema := schema.Properties[propName]
-		field := createFieldData(propName, propSchema, schema, openapi, allowedPackages, externalImports, currentPkgPath)
+		field := createFieldData(propName, propSchema, parentSchemaName, schema, openapi, allowedPackages, externalImports, currentPkgPath)
 		*fields = append(*fields, field)
 	}
 
@@ -469,15 +491,37 @@ func getSortedPropertyNames(properties map[string]*huma.Schema) []string {
 	return propNames
 }
 
-// createFieldData creates a FieldData from property information
-func createFieldData(propName string, propSchema, parentSchema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) FieldData {
+// createFieldData creates a FieldData from property information.
+// It uses the Huma schema registry's reflect.Type info to faithfully
+// reproduce the original Go type's pointer semantics.
+func createFieldData(propName string, propSchema *huma.Schema, parentSchemaName string, parentSchema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) FieldData {
 	fieldName := casing.Camel(propName, casing.Initialism)
-	isFieldNullable := !isRequired(parentSchema, propName)
-	usePointer := isFieldNullable || isCircularReference(propSchema, parentSchema, openapi)
-	goType := schemaToGoTypeWithNullability(propSchema, openapi, usePointer, allowedPackages, externalImports, currentPkgPath)
 
+	// Use reflect type as the authoritative source for pointer detection.
+	// This handles cases where Huma doesn't set schema.Nullable (e.g. *Struct).
+	fieldIsPointer, elemIsPointer := getFieldNullability(parentSchemaName, propName, openapi)
+
+	// Determine nullable: the field was originally a pointer, or is a circular
+	// reference, or is a non-required object/$ref (for proper omitempty behavior).
+	nullable := fieldIsPointer || isCircularReference(propSchema, parentSchema, openapi)
+	if !nullable && !isRequired(parentSchema, propName) {
+		resolved := resolveSchema(propSchema, openapi)
+		if propSchema.Ref != "" || resolved.Type == "object" {
+			nullable = true
+		}
+	}
+
+	goType := schemaToGoType(propSchema, openapi, nullable, allowedPackages, externalImports, currentPkgPath)
+
+	// Fix array element pointers: if the original Go slice had pointer elements
+	// (e.g. []*Thing) but the schema doesn't carry that info, patch the type.
+	if elemIsPointer && strings.HasPrefix(goType, "[]") && !strings.HasPrefix(goType, "[]*") {
+		goType = "[]*" + goType[2:]
+	}
+
+	// Use omitempty for non-required fields or fields that were originally pointers
 	jsonTag := propName
-	if isFieldNullable {
+	if !isRequired(parentSchema, propName) || fieldIsPointer {
 		jsonTag += ",omitempty"
 	}
 
@@ -592,7 +636,7 @@ func buildHumaTags(schema *huma.Schema) string {
 }
 
 // buildOperations generates operation data from OpenAPI paths
-func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
+func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string, pagination *PaginationOptions) error {
 	allOptions := make(map[string]OptionField)
 
 	paths := getSortedPaths(openapi.Paths)
@@ -605,7 +649,7 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 				continue
 			}
 
-			opData, err := createOperationData(operation, method, path, openapi, allowedPackages, externalImports, allOptions, currentPkgPath)
+			opData, err := createOperationData(operation, method, path, openapi, allowedPackages, externalImports, allOptions, currentPkgPath, pagination)
 			if err != nil {
 				return fmt.Errorf("failed to create operation data for %s %s: %w", method, path, err)
 			}
@@ -654,7 +698,7 @@ func getOperationForMethod(pathItem *huma.PathItem, method string) *huma.Operati
 }
 
 // createOperationData creates an OperationData from operation details
-func createOperationData(operation *huma.Operation, method, path string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, allOptions map[string]OptionField, currentPkgPath string) (OperationData, error) {
+func createOperationData(operation *huma.Operation, method, path string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, allOptions map[string]OptionField, currentPkgPath string, pagination *PaginationOptions) (OperationData, error) {
 	opData := OperationData{
 		MethodName: generateMethodName(operation),
 		HTTPMethod: method,
@@ -669,7 +713,7 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 	opData.ReturnType, opData.ZeroValue, opData.HasResponseBody = generateReturnType(operation, openapi, allowedPackages, externalImports, currentPkgPath)
 
 	// Check for pagination support
-	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath)
+	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath, pagination)
 
 	// Handle parameters
 	if err := buildOperationParams(&opData, operation, allOptions, openapi, allowedPackages, externalImports, currentPkgPath); err != nil {
@@ -684,24 +728,83 @@ func handleRequestBody(opData *OperationData, operation *huma.Operation, openapi
 	if operation.RequestBody != nil && operation.RequestBody.Content != nil {
 		if jsonContent := operation.RequestBody.Content["application/json"]; jsonContent != nil {
 			opData.HasRequestBody = true
-			opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi, allowedPackages, externalImports, currentPkgPath)
+			opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi, false, allowedPackages, externalImports, currentPkgPath)
 			opData.HasOptionalBody = !operation.RequestBody.Required
 		}
 	}
 }
 
 // handlePagination processes pagination info for operation data
-func handlePagination(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) {
-	if isPaginatedOperation(operation, openapi) {
-		opData.IsPaginated = true
-		// Extract item type from array return type
-		for statusCode, response := range operation.Responses {
-			if statusCode[0] == '2' && response.Content != nil {
-				if jsonContent := response.Content["application/json"]; jsonContent != nil {
-					if jsonContent.Schema != nil && jsonContent.Schema.Type == "array" && jsonContent.Schema.Items != nil {
-						opData.ItemType = schemaToGoType(jsonContent.Schema.Items, openapi, allowedPackages, externalImports, currentPkgPath)
+func handlePagination(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string, pagination *PaginationOptions) {
+	if !isPaginatedOperation(operation, openapi, pagination) {
+		return
+	}
+
+	for statusCode, response := range operation.Responses {
+		if statusCode[0] != '2' || response.Content == nil {
+			continue
+		}
+		jsonContent := response.Content["application/json"]
+		if jsonContent == nil || jsonContent.Schema == nil {
+			continue
+		}
+		resolved := resolveSchema(jsonContent.Schema, openapi)
+
+		// Array response pagination (existing behavior)
+		if resolved.Type == "array" && resolved.Items != nil {
+			opData.IsPaginated = true
+			opData.ItemType = schemaToGoType(resolved.Items, openapi, false, allowedPackages, externalImports, currentPkgPath)
+			// Check if the original Go type has pointer elements via reflect
+			// (only if schema.Nullable didn't already produce a pointer type)
+			if !strings.HasPrefix(opData.ItemType, "*") && isSliceOfPointers(jsonContent.Schema.Ref, openapi) {
+				opData.ItemType = "*" + opData.ItemType
+			}
+			return
+		}
+
+		// Object-wrapped response pagination
+		if resolved.Type == "object" && pagination != nil && pagination.ItemsField != "" {
+			for propName, propSchema := range resolved.Properties {
+				goName := casing.Camel(propName, casing.Initialism)
+				if goName == pagination.ItemsField && propSchema.Type == "array" && propSchema.Items != nil {
+					// Verify pagination source exists: Link header or NextField property
+					hasLinkHeader := response.Headers != nil && response.Headers["Link"] != nil
+					hasNextField := false
+					if pagination.NextField != "" {
+						firstSegment := pagination.NextField
+						if idx := strings.Index(firstSegment, "."); idx >= 0 {
+							firstSegment = firstSegment[:idx]
+						}
+						for nextPropName := range resolved.Properties {
+							goNextName := casing.Camel(nextPropName, casing.Initialism)
+							if goNextName == firstSegment {
+								hasNextField = true
+								break
+							}
+						}
+					}
+					if !hasLinkHeader && !hasNextField {
 						return
 					}
+
+					opData.IsPaginated = true
+					opData.ItemType = schemaToGoType(propSchema.Items, openapi, false, allowedPackages, externalImports, currentPkgPath)
+					// Check if array items are pointers using reflect type info
+					// (only if schema.Nullable didn't already produce a pointer type)
+					if !strings.HasPrefix(opData.ItemType, "*") && jsonContent.Schema.Ref != "" {
+						parts := strings.Split(jsonContent.Schema.Ref, "/")
+						parentSchemaName := parts[len(parts)-1]
+						_, elemIsPointer := getFieldNullability(parentSchemaName, propName, openapi)
+						if elemIsPointer {
+							opData.ItemType = "*" + opData.ItemType
+						}
+					}
+					opData.ItemsField = pagination.ItemsField
+					if hasNextField {
+						opData.NextField = pagination.NextField
+					}
+					opData.ResponseType = schemaToGoType(jsonContent.Schema, openapi, false, allowedPackages, externalImports, currentPkgPath)
+					return
 				}
 			}
 		}
@@ -749,7 +852,7 @@ func createParamData(param *huma.Param, openapi *huma.OpenAPI, allowedPackages [
 	}
 
 	if param.Schema != nil {
-		paramData.Type = schemaToGoType(param.Schema, openapi, allowedPackages, externalImports, currentPkgPath)
+		paramData.Type = schemaToGoType(param.Schema, openapi, false, allowedPackages, externalImports, currentPkgPath)
 	}
 
 	return paramData
@@ -779,9 +882,9 @@ func hasRequestBodies(openapi *huma.OpenAPI) bool {
 }
 
 // hasPaginatedOperations checks if any operation in the API supports pagination
-func hasPaginatedOperations(openapi *huma.OpenAPI) bool {
+func hasPaginatedOperations(openapi *huma.OpenAPI, pagination *PaginationOptions) bool {
 	return hasAnyOperation(openapi, func(op *huma.Operation) bool {
-		return isPaginatedOperation(op, openapi)
+		return isPaginatedOperation(op, openapi, pagination)
 	})
 }
 
@@ -797,20 +900,71 @@ func hasAnyOperation(openapi *huma.OpenAPI, condition func(*huma.Operation) bool
 	return false
 }
 
+// resolveSchema resolves a schema reference to the actual schema using the
+// registry's SchemaFromRef. If the schema is not a reference, it is returned as-is.
+func resolveSchema(schema *huma.Schema, openapi *huma.OpenAPI) *huma.Schema {
+	if schema.Ref == "" {
+		return schema
+	}
+	if openapi == nil || openapi.Components == nil || openapi.Components.Schemas == nil {
+		return schema
+	}
+	if resolved := openapi.Components.Schemas.SchemaFromRef(schema.Ref); resolved != nil {
+		return resolved
+	}
+	return schema
+}
+
 // isPaginatedOperation checks if an operation supports pagination
-func isPaginatedOperation(operation *huma.Operation, openapi *huma.OpenAPI) bool {
+func isPaginatedOperation(operation *huma.Operation, openapi *huma.OpenAPI, pagination *PaginationOptions) bool {
 	if operation.Responses == nil {
 		return false
 	}
 
-	// Check if operation returns an array and has Link header
 	for statusCode, response := range operation.Responses {
-		if statusCode[0] == '2' && response.Content != nil {
-			if jsonContent := response.Content["application/json"]; jsonContent != nil {
-				if jsonContent.Schema != nil && jsonContent.Schema.Type == "array" {
-					// Check if response defines Link header
-					if response.Headers != nil {
-						if linkHeader := response.Headers["Link"]; linkHeader != nil {
+		if statusCode[0] != '2' || response.Content == nil {
+			continue
+		}
+		jsonContent := response.Content["application/json"]
+		if jsonContent == nil || jsonContent.Schema == nil {
+			continue
+		}
+		schema := resolveSchema(jsonContent.Schema, openapi)
+
+		// Array response with Link header (existing behavior)
+		if schema.Type == "array" {
+			if response.Headers != nil {
+				if _, ok := response.Headers["Link"]; ok {
+					return true
+				}
+			}
+		}
+
+		// Object-wrapped response with configured items field
+		if schema.Type == "object" && pagination != nil && pagination.ItemsField != "" {
+			hasItemsArray := false
+			for propName, propSchema := range schema.Properties {
+				goName := casing.Camel(propName, casing.Initialism)
+				if goName == pagination.ItemsField && propSchema.Type == "array" {
+					hasItemsArray = true
+					break
+				}
+			}
+			if hasItemsArray {
+				// Need either a Link header or a configured NextField that exists in this schema
+				hasLinkHeader := response.Headers != nil && response.Headers["Link"] != nil
+				if hasLinkHeader {
+					return true
+				}
+				if pagination.NextField != "" {
+					// Verify the first segment of the NextField path exists as a property
+					firstSegment := pagination.NextField
+					if idx := strings.Index(firstSegment, "."); idx >= 0 {
+						firstSegment = firstSegment[:idx]
+					}
+					for propName := range schema.Properties {
+						goName := casing.Camel(propName, casing.Initialism)
+						if goName == firstSegment {
 							return true
 						}
 					}
@@ -880,7 +1034,7 @@ func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowe
 
 	responseType := "any"
 	if responseSchema != nil {
-		responseType = schemaToGoType(responseSchema, openapi, allowedPackages, externalImports, currentPkgPath)
+		responseType = schemaToGoType(responseSchema, openapi, false, allowedPackages, externalImports, currentPkgPath)
 	}
 
 	zeroValue := getZeroValue(responseType)
@@ -948,44 +1102,110 @@ func isRequired(schema *huma.Schema, propName string) bool {
 	return false
 }
 
-// schemaToGoType converts an OpenAPI schema type to a Go type
-func schemaToGoType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) string {
-	return schemaToGoTypeWithNullability(schema, openapi, false, allowedPackages, externalImports, currentPkgPath)
+// getFieldNullability uses the Huma schema registry's Go reflect.Type to
+// determine whether a struct field was originally a pointer (and for slice
+// fields, whether the slice elements were pointers). This is the authoritative
+// source because Huma does not set schema.Nullable for pointer-to-object types.
+func getFieldNullability(parentSchemaName, jsonPropName string, openapi *huma.OpenAPI) (fieldIsPointer, elemIsPointer bool) {
+	if openapi == nil || openapi.Components == nil || openapi.Components.Schemas == nil {
+		return false, false
+	}
+	goType := openapi.Components.Schemas.TypeFromRef("#/components/schemas/" + parentSchemaName)
+	if goType == nil {
+		return false, false
+	}
+	for goType.Kind() == reflect.Pointer {
+		goType = goType.Elem()
+	}
+	if goType.Kind() != reflect.Struct {
+		return false, false
+	}
+	for i := 0; i < goType.NumField(); i++ {
+		field := goType.Field(i)
+		jsonTag := field.Tag.Get("json")
+		jsonName, _, _ := strings.Cut(jsonTag, ",")
+		if jsonName == jsonPropName {
+			ft := field.Type
+			fieldIsPointer = ft.Kind() == reflect.Pointer
+			if ft.Kind() == reflect.Slice {
+				elemIsPointer = ft.Elem().Kind() == reflect.Pointer
+			}
+			return
+		}
+	}
+	return false, false
 }
 
-// schemaToGoTypeWithNullability converts an OpenAPI schema type to a Go type with optional nullability
-func schemaToGoTypeWithNullability(schema *huma.Schema, openapi *huma.OpenAPI, isNullable bool, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) string {
+// isSliceOfPointers checks if a schema ref points to a Go slice type whose
+// elements are pointers. Used by pagination to detect e.g. []*Thing.
+func isSliceOfPointers(ref string, openapi *huma.OpenAPI) bool {
+	if ref == "" || openapi == nil || openapi.Components == nil || openapi.Components.Schemas == nil {
+		return false
+	}
+	goType := openapi.Components.Schemas.TypeFromRef(ref)
+	if goType == nil {
+		return false
+	}
+	for goType.Kind() == reflect.Pointer {
+		goType = goType.Elem()
+	}
+	return goType.Kind() == reflect.Slice && goType.Elem().Kind() == reflect.Pointer
+}
+
+// schemaToGoType converts an OpenAPI schema to a Go type string. The nullable
+// parameter is a caller-provided hint (e.g. from reflect type info or circular
+// reference detection). The function also checks the schema's own Nullable flag
+// and the resolved schema's Nullable flag, so callers don't need to resolve
+// $ref or inspect Nullable themselves.
+func schemaToGoType(schema *huma.Schema, openapi *huma.OpenAPI, nullable bool, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) string {
+	// Check the schema's own Nullable flag (including on $ref wrappers)
+	if schema.Nullable {
+		nullable = true
+	}
+	// Also check the resolved schema's Nullable flag
+	resolved := resolveSchema(schema, openapi)
+	if resolved.Nullable {
+		nullable = true
+	}
+
 	// Handle references first
 	if schema.Ref != "" {
-		return handleReference(schema.Ref, openapi, allowedPackages, externalImports, isNullable, currentPkgPath)
+		return handleReference(schema.Ref, openapi, allowedPackages, externalImports, nullable, currentPkgPath)
 	}
 
 	switch schema.Type {
 	case "string":
-		return handleStringType(schema.Format, externalImports, isNullable)
+		return handleStringType(schema.Format, externalImports, nullable)
 	case "integer":
-		return handleIntegerType(schema.Format)
+		return handleIntegerType(schema.Format, nullable)
 	case "number":
-		return handleNumberType(schema.Format)
+		return handleNumberType(schema.Format, nullable)
 	case "boolean":
+		if nullable {
+			return "*bool"
+		}
 		return "bool"
 	case "array":
-		return handleArrayType(schema, openapi, allowedPackages, externalImports, currentPkgPath)
+		if schema.Items != nil {
+			return "[]" + schemaToGoType(schema.Items, openapi, false, allowedPackages, externalImports, currentPkgPath)
+		}
+		return "[]any"
 	case "object":
-		return handleObjectType(schema, openapi, allowedPackages, externalImports, isNullable, currentPkgPath)
+		// Note: $ref objects are already handled above the switch via handleReference
+		return "map[string]any"
 	default:
 		return "any"
 	}
 }
 
 // handleStringType handles string type conversions with format consideration
-func handleStringType(format string, externalImports map[string]bool, isNullable bool) string {
+func handleStringType(format string, externalImports map[string]bool, nullable bool) string {
 	switch format {
 	case "date-time", "datetime":
 		if externalImports != nil {
 			externalImports["time"] = true
 		}
-		if isNullable {
+		if nullable {
 			return "*time.Time"
 		}
 		return "time.Time"
@@ -995,12 +1215,15 @@ func handleStringType(format string, externalImports map[string]bool, isNullable
 		}
 		return "net.IP" // net.IP can be nil naturally
 	default:
+		if nullable {
+			return "*string"
+		}
 		return "string"
 	}
 }
 
 // handleIntegerType handles integer type conversions with format consideration
-func handleIntegerType(format string) string {
+func handleIntegerType(format string, nullable bool) string {
 	formatMap := map[string]string{
 		"int64":  "int64",
 		"int32":  "int32",
@@ -1011,35 +1234,26 @@ func handleIntegerType(format string) string {
 		"uint16": "uint16",
 		"uint8":  "uint8",
 	}
+	base := "int"
 	if goType, exists := formatMap[format]; exists {
-		return goType
+		base = goType
 	}
-	return "int"
+	if nullable {
+		return "*" + base
+	}
+	return base
 }
 
 // handleNumberType handles number type conversions
-func handleNumberType(format string) string {
+func handleNumberType(format string, nullable bool) string {
+	base := "float64"
 	if format == "float" {
-		return "float32"
+		base = "float32"
 	}
-	return "float64"
-}
-
-// handleArrayType handles array type conversions
-func handleArrayType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) string {
-	if schema.Items != nil {
-		itemType := schemaToGoType(schema.Items, openapi, allowedPackages, externalImports, currentPkgPath)
-		return "[]" + itemType
+	if nullable {
+		return "*" + base
 	}
-	return "[]any"
-}
-
-// handleObjectType handles object type conversions
-func handleObjectType(schema *huma.Schema, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, isNullable bool, currentPkgPath string) string {
-	if schema.Ref != "" {
-		return handleReference(schema.Ref, openapi, allowedPackages, externalImports, isNullable, currentPkgPath)
-	}
-	return "map[string]any"
+	return base
 }
 
 // handleReference handles schema references
@@ -1481,7 +1695,11 @@ func (c *{{.ClientStructName}}) Follow(ctx context.Context, link string, result 
 func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error] {
 	return func(yield func({{.ItemType}}, error) bool) {
 		// Start with the first page
+{{- if .ResponseType}}
+		resp, result, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
+{{- else}}
 		resp, items, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
+{{- end}}
 		if err != nil {
 			var zero {{.ItemType}}
 			if !yield(zero, err) {
@@ -1491,7 +1709,11 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{r
 		}
 
 		// Yield all items from the first page
+{{- if .ResponseType}}
+		for _, item := range result.{{.ItemsField}} {
+{{- else}}
 		for _, item := range items {
+{{- end}}
 			if !yield(item, nil) {
 				return
 			}
@@ -1499,21 +1721,32 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{r
 
 		// Follow pagination links
 		for {
+			nextURL := ""
 			// Check for Link header with rel=next
 			linkHeader := resp.Header.Get("Link")
-			if linkHeader == "" {
-				break
+			if linkHeader != "" {
+				nextURL = parseLinkHeader(linkHeader, "next")
 			}
+{{- if .NextField}}
 
-			// Parse Link header to find next URL
-			nextURL := parseLinkHeader(linkHeader, "next")
+			// Fall back to body field for next page URL
+			if nextURL == "" && result.{{.NextField}} != "" {
+				nextURL = result.{{.NextField}}
+			}
+{{- end}}
+
 			if nextURL == "" {
 				break
 			}
 
 			// Fetch next page using Follow method
+{{- if .ResponseType}}
+			var nextResult {{.ResponseType}}
+			resp, err = c.Follow(ctx, nextURL, &nextResult, opts...)
+{{- else}}
 			var nextItems []{{.ItemType}}
 			resp, err = c.Follow(ctx, nextURL, &nextItems, opts...)
+{{- end}}
 			if err != nil {
 				var zero {{.ItemType}}
 				if !yield(zero, err) {
@@ -1523,11 +1756,19 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{r
 			}
 
 			// Yield all items from this page
+{{- if .ResponseType}}
+			for _, item := range nextResult.{{.ItemsField}} {
+{{- else}}
 			for _, item := range nextItems {
+{{- end}}
 				if !yield(item, nil) {
 					return
 				}
 			}
+{{- if .ResponseType}}
+
+			result = nextResult
+{{- end}}
 		}
 	}
 }
