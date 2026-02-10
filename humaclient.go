@@ -34,6 +34,8 @@ type ClientTemplateData struct {
 	Operations          []OperationData
 	RequestOptionFields []OptionField
 	HasRequestBodies    bool
+	HasMergePatch       bool // Whether any operation uses merge-patch content type
+	HasJSONPatchOp      bool // Whether JSONPatchOp already exists as a schema struct
 }
 
 // SchemaData represents an OpenAPI schema for code generation
@@ -73,6 +75,7 @@ type OperationData struct {
 	OptionsFields     []OptionField
 	IsPaginated       bool
 	ItemType          string
+	IsMergePatch      bool // Whether this operation uses application/merge-patch+json
 }
 
 // ParamData represents a parameter
@@ -242,6 +245,22 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 	// Generate operations
 	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi, opts.AllowedPackages, externalImports, currentPkgPath); err != nil {
 		return nil, fmt.Errorf("failed to build operations: %w", err)
+	}
+
+	// Check if any operations use merge-patch (Patchable) body types
+	for _, op := range data.Operations {
+		if op.IsMergePatch {
+			data.HasMergePatch = true
+			break
+		}
+	}
+
+	// Check if JSONPatchOp already exists as a schema struct (e.g. from Huma autopatch)
+	for _, s := range data.Schemas {
+		if s.StructName == "JSONPatchOp" {
+			data.HasJSONPatchOp = true
+			break
+		}
 	}
 
 	// Add standard library imports that were collected as external imports
@@ -681,12 +700,26 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 
 // handleRequestBody processes request body for operation data
 func handleRequestBody(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) {
-	if operation.RequestBody != nil && operation.RequestBody.Content != nil {
-		if jsonContent := operation.RequestBody.Content["application/json"]; jsonContent != nil {
-			opData.HasRequestBody = true
-			opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi, allowedPackages, externalImports, currentPkgPath)
-			opData.HasOptionalBody = !operation.RequestBody.Required
-		}
+	if operation.RequestBody == nil || operation.RequestBody.Content == nil {
+		return
+	}
+
+	// Check for standard JSON content type first
+	if jsonContent := operation.RequestBody.Content["application/json"]; jsonContent != nil {
+		opData.HasRequestBody = true
+		opData.RequestBodyType = schemaToGoType(jsonContent.Schema, openapi, allowedPackages, externalImports, currentPkgPath)
+		opData.HasOptionalBody = !operation.RequestBody.Required
+		return
+	}
+
+	// Check for autopatch: requires both merge-patch and JSON patch content types.
+	// This distinguishes Huma autopatch from manually defined PATCH operations
+	// that may use a single content type with a typed schema.
+	if operation.RequestBody.Content["application/merge-patch+json"] != nil &&
+		operation.RequestBody.Content["application/json-patch+json"] != nil {
+		opData.IsMergePatch = true
+		opData.HasRequestBody = true
+		opData.RequestBodyType = "Patchable"
 	}
 }
 
@@ -774,7 +807,12 @@ func addToOptionsIfNotExists(allOptions map[string]OptionField, operationOptions
 // hasRequestBodies checks if any operation in the API has request bodies
 func hasRequestBodies(openapi *huma.OpenAPI) bool {
 	return hasAnyOperation(openapi, func(op *huma.Operation) bool {
-		return op.RequestBody != nil && op.RequestBody.Content != nil && op.RequestBody.Content["application/json"] != nil
+		if op.RequestBody == nil || op.RequestBody.Content == nil {
+			return false
+		}
+		return op.RequestBody.Content["application/json"] != nil ||
+			(op.RequestBody.Content["application/merge-patch+json"] != nil &&
+				op.RequestBody.Content["application/json-patch+json"] != nil)
 	})
 }
 
@@ -1219,7 +1257,44 @@ func WithOptions(applier OptionsApplier) Option {
 		applier.Apply(opts)
 	}
 }
+{{if .HasMergePatch}}
+// Patchable is an interface for types that can be used as PATCH request bodies.
+// It is implemented by MergePatch and JSONPatch.
+type Patchable interface {
+	PatchContentType() string
+}
 
+// MergePatch represents a JSON Merge Patch (RFC 7396) document.
+// Fields set to non-nil values will be updated; fields set to nil will be removed.
+type MergePatch map[string]any
+
+func (m MergePatch) PatchContentType() string { return "application/merge-patch+json" }
+
+{{if not .HasJSONPatchOp}}
+// JSONPatchOp represents a single JSON Patch (RFC 6902) operation.
+type JSONPatchOp struct {
+	Op    string ` + "`json:\"op\" doc:\"Operation name\" enum:\"add,remove,replace,move,copy,test\"`" + `
+	Path  string ` + "`json:\"path\" doc:\"JSON Pointer to the field being operated on\"`" + `
+	From  string ` + "`json:\"from,omitempty\" doc:\"JSON Pointer for the source of a move or copy\"`" + `
+	Value any    ` + "`json:\"value,omitempty\" doc:\"The value to set\"`" + `
+}
+{{end}}
+// JSONPatch represents a JSON Patch (RFC 6902) document.
+type JSONPatch []JSONPatchOp
+
+func (j JSONPatch) PatchContentType() string { return "application/json-patch+json" }
+
+// WithIfMatch sets the If-Match header for conditional requests.
+// Use this with an ETag value from a previous GET to enable optimistic locking.
+func WithIfMatch(etag string) Option {
+	return WithHeader("If-Match", etag)
+}
+
+// WithIfNoneMatch sets the If-None-Match header for conditional requests.
+func WithIfNoneMatch(etag string) Option {
+	return WithHeader("If-None-Match", etag)
+}
+{{end}}
 {{/* Generate operation-specific option structs and apply methods */}}
 {{- range .Operations}}
 {{- if .OptionsStructName}}
@@ -1369,7 +1444,11 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 	// Set content type and apply custom headers
 {{- if or .HasRequestBody .HasOptionalBody}}
 	if reqBody != nil {
+{{- if .IsMergePatch}}
+		req.Header.Set("Content-Type", body.PatchContentType())
+{{- else}}
 		req.Header.Set("Content-Type", "application/json")
+{{- end}}
 	}
 {{- end}}
 	reqOpts.applyHeaders(req)

@@ -2556,13 +2556,13 @@ require github.com/danielgtaylor/huma/v2 v2.15.0
 	})
 
 	t.Run("UsesUnqualifiedTypesForSelfImports", func(t *testing.T) {
-		outputDir := "myapiclient" 
-		
+		outputDir := "myapiclient"
+
 		opts := Options{
 			PackageName:     "myapiclient",
 			OutputDirectory: outputDir,
 			AllowedPackages: []string{
-				"example.com/myapi/myapiclient",  // Self-import - types should be unqualified
+				"example.com/myapi/myapiclient",    // Self-import - types should be unqualified
 				"github.com/danielgtaylor/huma/v2", // External import - types should be qualified
 			},
 		}
@@ -2601,4 +2601,481 @@ require github.com/danielgtaylor/huma/v2 v2.15.0
 
 		t.Logf("Successfully generated code with proper type reference handling")
 	})
+}
+
+// createAutopatchTestAPI creates a test API that simulates Huma's autopatch behavior:
+// a GET + PUT pair with a PATCH operation registered using application/merge-patch+json.
+func createAutopatchTestAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Autopatch API", "1.0.0"))
+
+	// GET /things/{id} - Get a thing
+	huma.Get(api, "/things/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id" doc:"Thing ID"`
+	}) (*GetThingResponse, error) {
+		return &GetThingResponse{
+			Body: TestThing{
+				ID:   input.ID,
+				Name: "Test Thing",
+			},
+		}, nil
+	})
+
+	// PUT /things/{id} - Update a thing
+	huma.Put(api, "/things/{id}", func(ctx context.Context, input *struct {
+		ID   string `path:"id"`
+		Body TestThing
+	}) (*CreateThingResponse, error) {
+		return &CreateThingResponse{
+			Body: input.Body,
+		}, nil
+	})
+
+	// Simulate autopatch: register a PATCH operation with application/merge-patch+json
+	// This mimics what huma/autopatch.AutoPatch does internally.
+	openapi := api.OpenAPI()
+	pathItem := openapi.Paths["/things/{id}"]
+	putOp := pathItem.Put
+
+	// Get the PUT body schema and create an "optional" version (Required cleared)
+	putSchema := putOp.RequestBody.Content["application/json"].Schema
+	if putSchema.Ref != "" {
+		putSchema = openapi.Components.Schemas.SchemaFromRef(putSchema.Ref)
+	}
+	optionalSchema := *putSchema
+	optionalSchema.Required = nil
+
+	// Get the PUT response schema for the PATCH response
+	var responseSchema *huma.Schema
+	var responseStatusCode string
+	for code, resp := range putOp.Responses {
+		if code[0] == '2' && resp.Content != nil {
+			if jsonContent := resp.Content["application/json"]; jsonContent != nil {
+				responseSchema = jsonContent.Schema
+				responseStatusCode = code
+				break
+			}
+		}
+	}
+
+	pathItem.Patch = &huma.Operation{
+		OperationID: "patch-things-by-id",
+		Summary:     "Patch thing by ID",
+		Parameters: []*huma.Param{
+			{Name: "id", In: "path", Required: true, Schema: &huma.Schema{Type: "string"}},
+		},
+		RequestBody: &huma.RequestBody{
+			Required: true,
+			Content: map[string]*huma.MediaType{
+				"application/merge-patch+json": {
+					Schema: &optionalSchema,
+				},
+				"application/json-patch+json": {
+					Schema: &huma.Schema{
+						Type: "array",
+						Items: &huma.Schema{
+							Type: "object",
+							Properties: map[string]*huma.Schema{
+								"op":    {Type: "string"},
+								"path":  {Type: "string"},
+								"from":  {Type: "string"},
+								"value": {},
+							},
+							Required: []string{"op", "path"},
+						},
+					},
+				},
+			},
+		},
+		Responses: map[string]*huma.Response{
+			responseStatusCode: {
+				Description: "Successful response",
+				Content: map[string]*huma.MediaType{
+					"application/json": {
+						Schema: responseSchema,
+					},
+				},
+			},
+		},
+	}
+
+	return api
+}
+
+func TestPatchableCodeGeneration(t *testing.T) {
+	api := createAutopatchTestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_patchable_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join("autopatchapiclient", "client.go"))
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("GeneratesPatchableInterface", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type Patchable interface") {
+			t.Error("Generated code missing Patchable interface")
+		}
+	})
+
+	t.Run("GeneratesMergePatchType", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type MergePatch map[string]any") {
+			t.Error("Generated code missing MergePatch type")
+		}
+		if !strings.Contains(clientCode, `func (m MergePatch) PatchContentType() string`) {
+			t.Error("Generated code missing MergePatch.PatchContentType method")
+		}
+	})
+
+	t.Run("GeneratesJSONPatchTypes", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type JSONPatchOp struct") {
+			t.Error("Generated code missing JSONPatchOp struct")
+		}
+		if !strings.Contains(clientCode, "type JSONPatch []JSONPatchOp") {
+			t.Error("Generated code missing JSONPatch type")
+		}
+		if !strings.Contains(clientCode, `func (j JSONPatch) PatchContentType() string`) {
+			t.Error("Generated code missing JSONPatch.PatchContentType method")
+		}
+	})
+
+	t.Run("JSONPatchOpHasCorrectFields", func(t *testing.T) {
+		expectedFields := []string{
+			`json:"op"`,
+			`json:"path"`,
+			`json:"from,omitempty"`,
+			`json:"value,omitempty"`,
+		}
+		for _, field := range expectedFields {
+			if !strings.Contains(clientCode, field) {
+				t.Errorf("JSONPatchOp missing expected field tag: %s", field)
+			}
+		}
+	})
+
+	t.Run("GeneratesConditionalHeaderHelpers", func(t *testing.T) {
+		if !strings.Contains(clientCode, "func WithIfMatch(etag string) Option") {
+			t.Error("Generated code missing WithIfMatch helper")
+		}
+		if !strings.Contains(clientCode, "func WithIfNoneMatch(etag string) Option") {
+			t.Error("Generated code missing WithIfNoneMatch helper")
+		}
+	})
+
+	t.Run("PatchMethodHasPatchableBody", func(t *testing.T) {
+		if !strings.Contains(clientCode, "body Patchable") {
+			t.Error("Patch method should have Patchable body parameter")
+		}
+	})
+
+	t.Run("PatchMethodSetsDynamicContentType", func(t *testing.T) {
+		if !strings.Contains(clientCode, `req.Header.Set("Content-Type", body.PatchContentType())`) {
+			t.Error("Patch method should set Content-Type dynamically from body.PatchContentType()")
+		}
+	})
+
+	t.Run("PutMethodStillUsesApplicationJSON", func(t *testing.T) {
+		if !strings.Contains(clientCode, `req.Header.Set("Content-Type", "application/json")`) {
+			t.Error("PUT method should still use application/json Content-Type")
+		}
+	})
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has invalid Go syntax: %v", err)
+		}
+	})
+
+	t.Run("InterfaceIncludesPatchMethod", func(t *testing.T) {
+		if !strings.Contains(clientCode, "PatchThingsByID(ctx context.Context, id string, body Patchable, opts ...Option)") {
+			t.Error("Interface missing PatchThingsByID method with Patchable body")
+		}
+	})
+
+	t.Run("OriginalStructUnchanged", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type TestThing struct") {
+			t.Error("Original TestThing struct should still be generated")
+		}
+		thStart := strings.Index(clientCode, "type TestThing struct")
+		thEnd := strings.Index(clientCode[thStart:], "\n}")
+		thStruct := clientCode[thStart : thStart+thEnd]
+		if !strings.Contains(thStruct, `json:"id"`) {
+			t.Error("Original TestThing ID field should NOT have omitempty (it's required)")
+		}
+	})
+}
+
+func TestPatchableBehavior(t *testing.T) {
+	api := createAutopatchTestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_patchable_behavior_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	// Create a test server that handles PATCH requests
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "PATCH" && r.URL.Path == "/things/test123":
+			// Read the patch body and echo back metadata for verification
+			body, _ := io.ReadAll(r.Body)
+			result := map[string]any{
+				"patch":       json.RawMessage(body),
+				"contentType": r.Header.Get("Content-Type"),
+				"ifMatch":     r.Header.Get("If-Match"),
+			}
+			json.NewEncoder(w).Encode(result)
+
+		default:
+			w.WriteHeader(404)
+			w.Write([]byte(`{"error":"not found"}`))
+		}
+	}))
+	defer server.Close()
+
+	// Create go.mod for the test program
+	os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644)
+
+	t.Run("MergePatchRequest", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/autopatchapiclient"
+)
+
+func main() {
+	client := autopatchapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	resp, _, err := client.PatchThingsByID(context.Background(), "test123",
+		autopatchapiclient.MergePatch{
+			"name": "updated name",
+		},
+	)
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	output := map[string]any{
+		"statusCode":  resp.StatusCode,
+		"contentType": resp.Request.Header.Get("Content-Type"),
+	}
+	json.NewEncoder(os.Stdout).Encode(output)
+}
+`, server.URL)
+
+		os.WriteFile("test_merge_patch.go", []byte(testProgram), 0644)
+
+		output, err := runGoProgram("test_merge_patch.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v\nOutput: %s", err, output)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+		}
+
+		if int(result["statusCode"].(float64)) != 200 {
+			t.Errorf("Expected status 200, got %v", result["statusCode"])
+		}
+
+		if result["contentType"] != "application/merge-patch+json" {
+			t.Errorf("Expected Content-Type 'application/merge-patch+json', got %v", result["contentType"])
+		}
+	})
+
+	t.Run("JSONPatchRequest", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/autopatchapiclient"
+)
+
+func main() {
+	client := autopatchapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	resp, _, err := client.PatchThingsByID(context.Background(), "test123",
+		autopatchapiclient.JSONPatch{
+			{Op: "replace", Path: "/name", Value: "patched"},
+			{Op: "remove", Path: "/tags"},
+		},
+	)
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	output := map[string]any{
+		"statusCode":  resp.StatusCode,
+		"contentType": resp.Request.Header.Get("Content-Type"),
+	}
+	json.NewEncoder(os.Stdout).Encode(output)
+}
+`, server.URL)
+
+		os.WriteFile("test_json_patch.go", []byte(testProgram), 0644)
+
+		output, err := runGoProgram("test_json_patch.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v\nOutput: %s", err, output)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+		}
+
+		if int(result["statusCode"].(float64)) != 200 {
+			t.Errorf("Expected status 200, got %v", result["statusCode"])
+		}
+
+		if result["contentType"] != "application/json-patch+json" {
+			t.Errorf("Expected Content-Type 'application/json-patch+json', got %v", result["contentType"])
+		}
+	})
+
+	t.Run("MergePatchWithIfMatch", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/autopatchapiclient"
+)
+
+func main() {
+	client := autopatchapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	resp, _, err := client.PatchThingsByID(context.Background(), "test123",
+		autopatchapiclient.MergePatch{"name": "patched"},
+		autopatchapiclient.WithIfMatch("\"etag-value-123\""),
+	)
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	output := map[string]any{
+		"statusCode": resp.StatusCode,
+		"ifMatch":    resp.Request.Header.Get("If-Match"),
+	}
+	json.NewEncoder(os.Stdout).Encode(output)
+}
+`, server.URL)
+
+		os.WriteFile("test_patch_ifmatch.go", []byte(testProgram), 0644)
+
+		output, err := runGoProgram("test_patch_ifmatch.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v\nOutput: %s", err, output)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+		}
+
+		if int(result["statusCode"].(float64)) != 200 {
+			t.Errorf("Expected status 200, got %v", result["statusCode"])
+		}
+
+		if result["ifMatch"] != "\"etag-value-123\"" {
+			t.Errorf("Expected If-Match header '\"etag-value-123\"', got %v", result["ifMatch"])
+		}
+	})
+}
+
+func TestPatchableNotGeneratedWithoutAutopatch(t *testing.T) {
+	// Regular API without autopatch should NOT generate Patchable types
+	api := createTestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_no_patchable_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join("testapiclient", "client.go"))
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	if strings.Contains(clientCode, "Patchable") {
+		t.Error("Regular API should NOT generate Patchable types")
+	}
+	if strings.Contains(clientCode, "MergePatch") {
+		t.Error("Regular API should NOT generate MergePatch type")
+	}
+	if strings.Contains(clientCode, "JSONPatch") {
+		t.Error("Regular API should NOT generate JSONPatch types")
+	}
+	if strings.Contains(clientCode, "WithIfMatch") {
+		t.Error("Regular API should NOT generate WithIfMatch helper")
+	}
 }
