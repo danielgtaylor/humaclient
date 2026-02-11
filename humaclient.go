@@ -94,6 +94,7 @@ type OperationData struct {
 	ItemType          string
 	ItemsField        string // Go struct field name for items array in wrapped responses (e.g. "Items")
 	NextField         string // Go struct field path for next-page URL (e.g. "Next" or "Meta.Next")
+	NextFieldNilCheck string // Nil-check expression for nullable intermediate fields in NextField path
 	ResponseType      string // Wrapper struct type name for object-wrapped paginated responses
 }
 
@@ -770,21 +771,14 @@ func handlePagination(opData *OperationData, operation *huma.Operation, openapi 
 					// Verify pagination source exists: Link header or NextField property
 					hasLinkHeader := response.Headers != nil && response.Headers["Link"] != nil
 					hasNextField := false
+					var nextFieldNilChecks []string
 					if pagination.NextField != "" {
-						firstSegment := pagination.NextField
-						if idx := strings.Index(firstSegment, "."); idx >= 0 {
-							firstSegment = firstSegment[:idx]
-						}
-						for nextPropName := range resolved.Properties {
-							goNextName := casing.Camel(nextPropName, casing.Initialism)
-							if goNextName == firstSegment {
-								hasNextField = true
-								break
-							}
-						}
+						var valid bool
+						valid, nextFieldNilChecks = validateNextFieldPath(resolved, pagination.NextField, openapi)
+						hasNextField = valid
 					}
 					if !hasLinkHeader && !hasNextField {
-						return
+						continue
 					}
 
 					opData.IsPaginated = true
@@ -802,6 +796,9 @@ func handlePagination(opData *OperationData, operation *huma.Operation, openapi 
 					opData.ItemsField = pagination.ItemsField
 					if hasNextField {
 						opData.NextField = pagination.NextField
+						if len(nextFieldNilChecks) > 0 {
+							opData.NextFieldNilCheck = strings.Join(nextFieldNilChecks, " && ")
+						}
 					}
 					opData.ResponseType = schemaToGoType(jsonContent.Schema, openapi, false, allowedPackages, externalImports, currentPkgPath)
 					return
@@ -915,6 +912,48 @@ func resolveSchema(schema *huma.Schema, openapi *huma.OpenAPI) *huma.Schema {
 	return schema
 }
 
+// validateNextFieldPath validates the full dot-separated NextField path against
+// a schema, verifying each intermediate segment is an object and the final
+// segment is a string. Returns whether the path is valid and any nil-check
+// expressions needed for nullable intermediate fields.
+func validateNextFieldPath(schema *huma.Schema, path string, openapi *huma.OpenAPI) (valid bool, nilChecks []string) {
+	segments := strings.Split(path, ".")
+	current := schema
+	prefix := "result"
+
+	for i, segment := range segments {
+		found := false
+		for propName, propSchema := range current.Properties {
+			goName := casing.Camel(propName, casing.Initialism)
+			if goName == segment {
+				resolved := resolveSchema(propSchema, openapi)
+				if i < len(segments)-1 {
+					// Intermediate segment: must be an object
+					if resolved.Type != "object" {
+						return false, nil
+					}
+					if propSchema.Nullable {
+						nilChecks = append(nilChecks, prefix+"."+segment+" != nil")
+					}
+					prefix += "." + segment
+					current = resolved
+				} else {
+					// Final segment: must be a string
+					if resolved.Type != "string" {
+						return false, nil
+					}
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
+	}
+	return true, nilChecks
+}
+
 // isPaginatedOperation checks if an operation supports pagination
 func isPaginatedOperation(operation *huma.Operation, openapi *huma.OpenAPI, pagination *PaginationOptions) bool {
 	if operation.Responses == nil {
@@ -945,7 +984,7 @@ func isPaginatedOperation(operation *huma.Operation, openapi *huma.OpenAPI, pagi
 			hasItemsArray := false
 			for propName, propSchema := range schema.Properties {
 				goName := casing.Camel(propName, casing.Initialism)
-				if goName == pagination.ItemsField && propSchema.Type == "array" {
+				if goName == pagination.ItemsField && propSchema.Type == "array" && propSchema.Items != nil {
 					hasItemsArray = true
 					break
 				}
@@ -957,16 +996,8 @@ func isPaginatedOperation(operation *huma.Operation, openapi *huma.OpenAPI, pagi
 					return true
 				}
 				if pagination.NextField != "" {
-					// Verify the first segment of the NextField path exists as a property
-					firstSegment := pagination.NextField
-					if idx := strings.Index(firstSegment, "."); idx >= 0 {
-						firstSegment = firstSegment[:idx]
-					}
-					for propName := range schema.Properties {
-						goName := casing.Camel(propName, casing.Initialism)
-						if goName == firstSegment {
-							return true
-						}
+					if valid, _ := validateNextFieldPath(schema, pagination.NextField, openapi); valid {
+						return true
 					}
 				}
 			}
@@ -1730,7 +1761,7 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{r
 {{- if .NextField}}
 
 			// Fall back to body field for next page URL
-			if nextURL == "" && result.{{.NextField}} != "" {
+			if nextURL == ""{{if .NextFieldNilCheck}} && {{.NextFieldNilCheck}}{{end}} && result.{{.NextField}} != "" {
 				nextURL = result.{{.NextField}}
 			}
 {{- end}}

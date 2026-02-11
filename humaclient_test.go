@@ -3283,6 +3283,7 @@ func TestWrappedPaginationLinkPrecedence(t *testing.T) {
 	// Server that provides both Link header and body next field
 	// Link header points to /items?via=link, body points to /items?via=body
 	requestCount := 0
+	secondRequestVia := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		requestCount++
@@ -3296,11 +3297,10 @@ func TestWrappedPaginationLinkPrecedence(t *testing.T) {
 			})
 			w.Write(j)
 		} else {
-			// Second request - verify we got here via Link header
+			secondRequestVia = r.URL.Query().Get("via")
 			j, _ := json.Marshal(map[string]any{
 				"items": []map[string]string{{"id": "2", "name": "Second"}},
 				"total": 2,
-				"via":   r.URL.Query().Get("via"),
 			})
 			w.Write(j)
 		}
@@ -3330,18 +3330,19 @@ func main() {
 		Timeout: time.Second * 5,
 	})
 
-	// Just call ListItems directly to get second page URL
-	_, result, err := client.ListItems(context.Background())
-	if err != nil {
-		fmt.Printf("ERROR: %%v\n", err)
-		os.Exit(1)
+	// Use paginator to iterate all pages, triggering the second request
+	var allItems []map[string]string
+	for item, err := range client.ListItemsPaginator(context.Background()) {
+		if err != nil {
+			fmt.Printf("ERROR: %%v\n", err)
+			os.Exit(1)
+		}
+		allItems = append(allItems, map[string]string{"id": item.ID, "name": item.Name})
 	}
 
-	// The raw method should return the full wrapper struct
 	json.NewEncoder(os.Stdout).Encode(map[string]any{
-		"itemCount": len(result.Items),
-		"total":     result.Total,
-		"next":      result.Next,
+		"count": len(allItems),
+		"items": allItems,
 	})
 }
 `, server.URL)
@@ -3361,12 +3362,17 @@ func main() {
 		t.Fatalf("Failed to parse test output: %v\nOutput: %s", err, output)
 	}
 
-	// Verify the raw method returns the full wrapper struct
-	if int(result["itemCount"].(float64)) != 1 {
-		t.Errorf("Expected 1 item in first page, got %v", result["itemCount"])
+	// Verify paginator collected items from both pages
+	if int(result["count"].(float64)) != 2 {
+		t.Errorf("Expected 2 items from paginator, got %v", result["count"])
 	}
-	if int(result["total"].(float64)) != 2 {
-		t.Errorf("Expected total=2, got %v", result["total"])
+
+	// Verify the second request was made via the Link header, not the body next field
+	if requestCount != 2 {
+		t.Errorf("Expected 2 requests, got %d", requestCount)
+	}
+	if secondRequestVia != "link" {
+		t.Errorf("Expected second request via Link header (via=link), got via=%s", secondRequestVia)
 	}
 }
 
