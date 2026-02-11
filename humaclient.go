@@ -1445,7 +1445,9 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- if or .HasRequestBody .HasOptionalBody}}
 	if reqBody != nil {
 {{- if .IsMergePatch}}
-		req.Header.Set("Content-Type", body.PatchContentType())
+		if body != nil {
+			req.Header.Set("Content-Type", body.PatchContentType())
+		}
 {{- else}}
 		req.Header.Set("Content-Type", "application/json")
 {{- end}}
