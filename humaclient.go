@@ -255,9 +255,9 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 		}
 	}
 
-	// Check if JSONPatchOp already exists as a schema struct (e.g. from Huma autopatch)
+	// Check if JSONPatchOp already exists as a non-external schema struct (e.g. from Huma autopatch)
 	for _, s := range data.Schemas {
-		if s.StructName == "JSONPatchOp" {
+		if s.StructName == "JSONPatchOp" && !s.IsExternal {
 			data.HasJSONPatchOp = true
 			break
 		}
