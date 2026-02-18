@@ -24,7 +24,13 @@ type GetThingResponse struct {
 
 type ListThingsResponse struct {
 	Link string `header:"Link" doc:"Link to the next page of results"`
-	Body []Thing
+	// Body could be a slice, but for the sake of showing a more complex example, we'll
+	// make it a struct with a field that contains the items to iterate over.
+	Body struct {
+		Items []*Thing `json:"items" doc:"The list of things"`
+		Total int      `json:"total" doc:"Total number of things"`
+		Next  string   `json:"next,omitempty" doc:"URL for the next page of results"`
+	}
 }
 
 func main() {
@@ -54,15 +60,27 @@ func main() {
 		Cursor string `query:"cursor" doc:"Pagination cursor"`
 	}) (*ListThingsResponse, error) {
 		return &ListThingsResponse{
-			Body: []Thing{
-				{ID: "thing1", Name: "First Thing"},
-				{ID: "thing2", Name: "Second Thing"},
+			Body: struct {
+				Items []*Thing `json:"items" doc:"The list of things"`
+				Total int      `json:"total" doc:"Total number of things"`
+				Next  string   `json:"next,omitempty" doc:"URL for the next page of results"`
+			}{
+				Items: []*Thing{
+					{ID: "thing1", Name: "First Thing"},
+					{ID: "thing2", Name: "Second Thing"},
+				},
+				Total: 2,
 			},
 		}, nil
 	})
 
-	// Register for client generation
-	humaclient.Register(api)
+	// Register for client generation with object-wrapped pagination
+	humaclient.RegisterWithOptions(api, humaclient.Options{
+		Pagination: &humaclient.PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		},
+	})
 
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }

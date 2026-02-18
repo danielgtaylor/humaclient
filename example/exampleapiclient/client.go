@@ -23,12 +23,19 @@ type ErrorDetail struct {
 
 // ErrorModel represents the ErrorModel schema
 type ErrorModel struct {
-	Detail   string        `json:"detail,omitempty" doc:"A human-readable explanation specific to this occurrence of the problem." example:"Property foo is required but is missing."`
-	Errors   []ErrorDetail `json:"errors,omitempty" doc:"Optional list of individual error details"`
-	Instance string        `json:"instance,omitempty" doc:"A URI reference that identifies the specific occurrence of the problem." format:"uri" example:"https://example.com/error-log/abc123"`
-	Status   int64         `json:"status,omitempty" doc:"HTTP status code" format:"int64" example:"400"`
-	Title    string        `json:"title,omitempty" doc:"A short, human-readable summary of the problem type. This value should not change between occurrences of the error." example:"Bad Request"`
-	Type     string        `json:"type,omitempty" doc:"A URI reference to human-readable documentation for the error." default:"about:blank" format:"uri" example:"https://example.com/errors/example"`
+	Detail   string         `json:"detail,omitempty" doc:"A human-readable explanation specific to this occurrence of the problem." example:"Property foo is required but is missing."`
+	Errors   []*ErrorDetail `json:"errors,omitempty" doc:"Optional list of individual error details"`
+	Instance string         `json:"instance,omitempty" doc:"A URI reference that identifies the specific occurrence of the problem." format:"uri" example:"https://example.com/error-log/abc123"`
+	Status   int64          `json:"status,omitempty" doc:"HTTP status code" format:"int64" example:"400"`
+	Title    string         `json:"title,omitempty" doc:"A short, human-readable summary of the problem type. This value should not change between occurrences of the error." example:"Bad Request"`
+	Type     string         `json:"type,omitempty" doc:"A URI reference to human-readable documentation for the error." default:"about:blank" format:"uri" example:"https://example.com/errors/example"`
+}
+
+// ListThingsResponseBody represents the ListThingsResponseBody schema
+type ListThingsResponseBody struct {
+	Items []*Thing `json:"items" doc:"The list of things"`
+	Next  string   `json:"next,omitempty" doc:"URL for the next page of results"`
+	Total int64    `json:"total" doc:"Total number of things" format:"int64"`
 }
 
 // Thing represents the Thing schema
@@ -129,8 +136,8 @@ func (o ListThingsOptions) Apply(opts *RequestOptions) {
 
 // ExampleAPIClient defines the interface for the API client
 type ExampleAPIClient interface {
-	ListThings(ctx context.Context, opts ...Option) (*http.Response, []Thing, error)
-	ListThingsPaginator(ctx context.Context, opts ...Option) iter.Seq2[Thing, error]
+	ListThings(ctx context.Context, opts ...Option) (*http.Response, ListThingsResponseBody, error)
+	ListThingsPaginator(ctx context.Context, opts ...Option) iter.Seq2[*Thing, error]
 	GetThingsByID(ctx context.Context, id string, opts ...Option) (*http.Response, Thing, error)
 	Follow(ctx context.Context, link string, result any, opts ...Option) (*http.Response, error)
 }
@@ -158,7 +165,7 @@ func NewWithClient(baseURL string, client *http.Client) ExampleAPIClient {
 }
 
 // ListThings calls the GET /things endpoint
-func (c *ExampleAPIClientImpl) ListThings(ctx context.Context, opts ...Option) (*http.Response, []Thing, error) {
+func (c *ExampleAPIClientImpl) ListThings(ctx context.Context, opts ...Option) (*http.Response, ListThingsResponseBody, error) {
 	// Apply options
 	reqOpts := &RequestOptions{}
 	for _, opt := range opts {
@@ -170,7 +177,7 @@ func (c *ExampleAPIClientImpl) ListThings(ctx context.Context, opts ...Option) (
 
 	u, err := url.Parse(c.baseURL + pathTemplate)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid URL: %w", err)
+		return nil, ListThingsResponseBody{}, fmt.Errorf("invalid URL: %w", err)
 	}
 
 	// Apply query parameters
@@ -182,7 +189,7 @@ func (c *ExampleAPIClientImpl) ListThings(ctx context.Context, opts ...Option) (
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), reqBody)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, ListThingsResponseBody{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	// Set content type and apply custom headers
@@ -191,19 +198,19 @@ func (c *ExampleAPIClientImpl) ListThings(ctx context.Context, opts ...Option) (
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("request failed: %w", err)
+		return nil, ListThingsResponseBody{}, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return resp, nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		return resp, ListThingsResponseBody{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
 	// Parse response body
-	var result []Thing
+	var result ListThingsResponseBody
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return resp, nil, fmt.Errorf("failed to decode response: %w", err)
+		return resp, ListThingsResponseBody{}, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	return resp, result, nil
@@ -328,12 +335,12 @@ func (c *ExampleAPIClientImpl) Follow(ctx context.Context, link string, result a
 }
 
 // ListThingsPaginator returns an iterator that fetches all pages of ListThings results
-func (c *ExampleAPIClientImpl) ListThingsPaginator(ctx context.Context, opts ...Option) iter.Seq2[Thing, error] {
-	return func(yield func(Thing, error) bool) {
+func (c *ExampleAPIClientImpl) ListThingsPaginator(ctx context.Context, opts ...Option) iter.Seq2[*Thing, error] {
+	return func(yield func(*Thing, error) bool) {
 		// Start with the first page
-		resp, items, err := c.ListThings(ctx, opts...)
+		resp, result, err := c.ListThings(ctx, opts...)
 		if err != nil {
-			var zero Thing
+			var zero *Thing
 			if !yield(zero, err) {
 				return
 			}
@@ -341,7 +348,7 @@ func (c *ExampleAPIClientImpl) ListThingsPaginator(ctx context.Context, opts ...
 		}
 
 		// Yield all items from the first page
-		for _, item := range items {
+		for _, item := range result.Items {
 			if !yield(item, nil) {
 				return
 			}
@@ -349,23 +356,27 @@ func (c *ExampleAPIClientImpl) ListThingsPaginator(ctx context.Context, opts ...
 
 		// Follow pagination links
 		for {
+			nextURL := ""
 			// Check for Link header with rel=next
 			linkHeader := resp.Header.Get("Link")
-			if linkHeader == "" {
-				break
+			if linkHeader != "" {
+				nextURL = parseLinkHeader(linkHeader, "next")
 			}
 
-			// Parse Link header to find next URL
-			nextURL := parseLinkHeader(linkHeader, "next")
+			// Fall back to body field for next page URL
+			if nextURL == "" && result.Next != "" {
+				nextURL = result.Next
+			}
+
 			if nextURL == "" {
 				break
 			}
 
 			// Fetch next page using Follow method
-			var nextItems []Thing
-			resp, err = c.Follow(ctx, nextURL, &nextItems, opts...)
+			var nextResult ListThingsResponseBody
+			resp, err = c.Follow(ctx, nextURL, &nextResult, opts...)
 			if err != nil {
-				var zero Thing
+				var zero *Thing
 				if !yield(zero, err) {
 					return
 				}
@@ -373,11 +384,13 @@ func (c *ExampleAPIClientImpl) ListThingsPaginator(ctx context.Context, opts ...
 			}
 
 			// Yield all items from this page
-			for _, item := range nextItems {
+			for _, item := range nextResult.Items {
 				if !yield(item, nil) {
 					return
 				}
 			}
+
+			result = nextResult
 		}
 	}
 }
