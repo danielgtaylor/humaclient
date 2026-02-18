@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -2556,13 +2557,13 @@ require github.com/danielgtaylor/huma/v2 v2.15.0
 	})
 
 	t.Run("UsesUnqualifiedTypesForSelfImports", func(t *testing.T) {
-		outputDir := "myapiclient" 
-		
+		outputDir := "myapiclient"
+
 		opts := Options{
 			PackageName:     "myapiclient",
 			OutputDirectory: outputDir,
 			AllowedPackages: []string{
-				"example.com/myapi/myapiclient",  // Self-import - types should be unqualified
+				"example.com/myapi/myapiclient",    // Self-import - types should be unqualified
 				"github.com/danielgtaylor/huma/v2", // External import - types should be qualified
 			},
 		}
@@ -2718,5 +2719,1823 @@ func TestRequestBodyNilCheckRemoval(t *testing.T) {
 		}
 		
 		t.Logf("Successfully verified Follow method keeps nil check for optional body")
+	})
+}
+
+// createAutopatchTestAPI creates a test API that simulates Huma's autopatch behavior:
+// a GET + PUT pair with a PATCH operation registered using application/merge-patch+json.
+func createAutopatchTestAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Autopatch API", "1.0.0"))
+
+	// GET /things/{id} - Get a thing
+	huma.Get(api, "/things/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id" doc:"Thing ID"`
+	}) (*GetThingResponse, error) {
+		return &GetThingResponse{
+			Body: TestThing{
+				ID:   input.ID,
+				Name: "Test Thing",
+			},
+		}, nil
+	})
+
+	// PUT /things/{id} - Update a thing
+	huma.Put(api, "/things/{id}", func(ctx context.Context, input *struct {
+		ID   string `path:"id"`
+		Body TestThing
+	}) (*CreateThingResponse, error) {
+		return &CreateThingResponse{
+			Body: input.Body,
+		}, nil
+	})
+
+	// Simulate autopatch: register a PATCH operation with application/merge-patch+json
+	// This mimics what huma/autopatch.AutoPatch does internally.
+	openapi := api.OpenAPI()
+	pathItem := openapi.Paths["/things/{id}"]
+	putOp := pathItem.Put
+
+	// Get the PUT body schema and create an "optional" version (Required cleared)
+	putSchema := putOp.RequestBody.Content["application/json"].Schema
+	if putSchema.Ref != "" {
+		putSchema = openapi.Components.Schemas.SchemaFromRef(putSchema.Ref)
+	}
+	optionalSchema := *putSchema
+	optionalSchema.Required = nil
+
+	// Get the PUT response schema for the PATCH response
+	var responseSchema *huma.Schema
+	var responseStatusCode string
+	for code, resp := range putOp.Responses {
+		if code[0] == '2' && resp.Content != nil {
+			if jsonContent := resp.Content["application/json"]; jsonContent != nil {
+				responseSchema = jsonContent.Schema
+				responseStatusCode = code
+				break
+			}
+		}
+	}
+
+	pathItem.Patch = &huma.Operation{
+		OperationID: "patch-things-by-id",
+		Summary:     "Patch thing by ID",
+		Parameters: []*huma.Param{
+			{Name: "id", In: "path", Required: true, Schema: &huma.Schema{Type: "string"}},
+		},
+		RequestBody: &huma.RequestBody{
+			Required: true,
+			Content: map[string]*huma.MediaType{
+				"application/merge-patch+json": {
+					Schema: &optionalSchema,
+				},
+				"application/json-patch+json": {
+					Schema: &huma.Schema{
+						Type: "array",
+						Items: &huma.Schema{
+							Type: "object",
+							Properties: map[string]*huma.Schema{
+								"op":    {Type: "string"},
+								"path":  {Type: "string"},
+								"from":  {Type: "string"},
+								"value": {},
+							},
+							Required: []string{"op", "path"},
+						},
+					},
+				},
+			},
+		},
+		Responses: map[string]*huma.Response{
+			responseStatusCode: {
+				Description: "Successful response",
+				Content: map[string]*huma.MediaType{
+					"application/json": {
+						Schema: responseSchema,
+					},
+				},
+			},
+		},
+	}
+
+	return api
+}
+
+func TestPatchableCodeGeneration(t *testing.T) {
+	api := createAutopatchTestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_patchable_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join("autopatchapiclient", "client.go"))
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("GeneratesPatchableInterface", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type Patchable interface") {
+			t.Error("Generated code missing Patchable interface")
+		}
+	})
+
+	t.Run("GeneratesMergePatchType", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type MergePatch map[string]any") {
+			t.Error("Generated code missing MergePatch type")
+		}
+		if !strings.Contains(clientCode, `func (m MergePatch) PatchContentType() string`) {
+			t.Error("Generated code missing MergePatch.PatchContentType method")
+		}
+	})
+
+	t.Run("GeneratesJSONPatchTypes", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type JSONPatchOp struct") {
+			t.Error("Generated code missing JSONPatchOp struct")
+		}
+		if !strings.Contains(clientCode, "type JSONPatch []JSONPatchOp") {
+			t.Error("Generated code missing JSONPatch type")
+		}
+		if !strings.Contains(clientCode, `func (j JSONPatch) PatchContentType() string`) {
+			t.Error("Generated code missing JSONPatch.PatchContentType method")
+		}
+	})
+
+	t.Run("JSONPatchOpHasCorrectFields", func(t *testing.T) {
+		expectedFields := []string{
+			`json:"op"`,
+			`json:"path"`,
+			`json:"from,omitempty"`,
+			`json:"value,omitempty"`,
+		}
+		for _, field := range expectedFields {
+			if !strings.Contains(clientCode, field) {
+				t.Errorf("JSONPatchOp missing expected field tag: %s", field)
+			}
+		}
+	})
+
+	t.Run("GeneratesConditionalHeaderHelpers", func(t *testing.T) {
+		if !strings.Contains(clientCode, "func WithIfMatch(etag string) Option") {
+			t.Error("Generated code missing WithIfMatch helper")
+		}
+		if !strings.Contains(clientCode, "func WithIfNoneMatch(etag string) Option") {
+			t.Error("Generated code missing WithIfNoneMatch helper")
+		}
+	})
+
+	t.Run("PatchMethodHasPatchableBody", func(t *testing.T) {
+		if !strings.Contains(clientCode, "body Patchable") {
+			t.Error("Patch method should have Patchable body parameter")
+		}
+	})
+
+	t.Run("PatchMethodSetsDynamicContentType", func(t *testing.T) {
+		if !strings.Contains(clientCode, `req.Header.Set("Content-Type", body.PatchContentType())`) {
+			t.Error("Patch method should set Content-Type dynamically from body.PatchContentType()")
+		}
+	})
+
+	t.Run("PutMethodStillUsesApplicationJSON", func(t *testing.T) {
+		if !strings.Contains(clientCode, `req.Header.Set("Content-Type", "application/json")`) {
+			t.Error("PUT method should still use application/json Content-Type")
+		}
+	})
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has invalid Go syntax: %v", err)
+		}
+	})
+
+	t.Run("InterfaceIncludesPatchMethod", func(t *testing.T) {
+		if !strings.Contains(clientCode, "PatchThingsByID(ctx context.Context, id string, body Patchable, opts ...Option)") {
+			t.Error("Interface missing PatchThingsByID method with Patchable body")
+		}
+	})
+
+	t.Run("OriginalStructUnchanged", func(t *testing.T) {
+		if !strings.Contains(clientCode, "type TestThing struct") {
+			t.Error("Original TestThing struct should still be generated")
+		}
+		thStart := strings.Index(clientCode, "type TestThing struct")
+		thEnd := strings.Index(clientCode[thStart:], "\n}")
+		thStruct := clientCode[thStart : thStart+thEnd]
+		if !strings.Contains(thStruct, `json:"id"`) {
+			t.Error("Original TestThing ID field should NOT have omitempty (it's required)")
+		}
+	})
+}
+
+func TestPatchableBehavior(t *testing.T) {
+	api := createAutopatchTestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_patchable_behavior_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	// Create a test server that handles PATCH requests
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == "PATCH" && r.URL.Path == "/things/test123":
+			// Read the patch body and echo back metadata for verification
+			body, _ := io.ReadAll(r.Body)
+			result := map[string]any{
+				"patch":       json.RawMessage(body),
+				"contentType": r.Header.Get("Content-Type"),
+				"ifMatch":     r.Header.Get("If-Match"),
+			}
+			json.NewEncoder(w).Encode(result)
+
+		default:
+			w.WriteHeader(404)
+			w.Write([]byte(`{"error":"not found"}`))
+		}
+	}))
+	defer server.Close()
+
+	// Create go.mod for the test program
+	os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644)
+
+	t.Run("MergePatchRequest", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/autopatchapiclient"
+)
+
+func main() {
+	client := autopatchapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	resp, _, err := client.PatchThingsByID(context.Background(), "test123",
+		autopatchapiclient.MergePatch{
+			"name": "updated name",
+		},
+	)
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	output := map[string]any{
+		"statusCode":  resp.StatusCode,
+		"contentType": resp.Request.Header.Get("Content-Type"),
+	}
+	json.NewEncoder(os.Stdout).Encode(output)
+}
+`, server.URL)
+
+		os.WriteFile("test_merge_patch.go", []byte(testProgram), 0644)
+
+		output, err := runGoProgram("test_merge_patch.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v\nOutput: %s", err, output)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+		}
+
+		if int(result["statusCode"].(float64)) != 200 {
+			t.Errorf("Expected status 200, got %v", result["statusCode"])
+		}
+
+		if result["contentType"] != "application/merge-patch+json" {
+			t.Errorf("Expected Content-Type 'application/merge-patch+json', got %v", result["contentType"])
+		}
+	})
+
+	t.Run("JSONPatchRequest", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/autopatchapiclient"
+)
+
+func main() {
+	client := autopatchapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	resp, _, err := client.PatchThingsByID(context.Background(), "test123",
+		autopatchapiclient.JSONPatch{
+			{Op: "replace", Path: "/name", Value: "patched"},
+			{Op: "remove", Path: "/tags"},
+		},
+	)
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	output := map[string]any{
+		"statusCode":  resp.StatusCode,
+		"contentType": resp.Request.Header.Get("Content-Type"),
+	}
+	json.NewEncoder(os.Stdout).Encode(output)
+}
+`, server.URL)
+
+		os.WriteFile("test_json_patch.go", []byte(testProgram), 0644)
+
+		output, err := runGoProgram("test_json_patch.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v\nOutput: %s", err, output)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+		}
+
+		if int(result["statusCode"].(float64)) != 200 {
+			t.Errorf("Expected status 200, got %v", result["statusCode"])
+		}
+
+		if result["contentType"] != "application/json-patch+json" {
+			t.Errorf("Expected Content-Type 'application/json-patch+json', got %v", result["contentType"])
+		}
+	})
+
+	t.Run("MergePatchWithIfMatch", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/autopatchapiclient"
+)
+
+func main() {
+	client := autopatchapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	resp, _, err := client.PatchThingsByID(context.Background(), "test123",
+		autopatchapiclient.MergePatch{"name": "patched"},
+		autopatchapiclient.WithIfMatch("\"etag-value-123\""),
+	)
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	output := map[string]any{
+		"statusCode": resp.StatusCode,
+		"ifMatch":    resp.Request.Header.Get("If-Match"),
+	}
+	json.NewEncoder(os.Stdout).Encode(output)
+}
+`, server.URL)
+
+		os.WriteFile("test_patch_ifmatch.go", []byte(testProgram), 0644)
+
+		output, err := runGoProgram("test_patch_ifmatch.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v\nOutput: %s", err, output)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+		}
+
+		if int(result["statusCode"].(float64)) != 200 {
+			t.Errorf("Expected status 200, got %v", result["statusCode"])
+		}
+
+		if result["ifMatch"] != "\"etag-value-123\"" {
+			t.Errorf("Expected If-Match header '\"etag-value-123\"', got %v", result["ifMatch"])
+		}
+	})
+}
+
+func TestPatchableNotGeneratedWithoutAutopatch(t *testing.T) {
+	// Regular API without autopatch should NOT generate Patchable types
+	api := createTestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_no_patchable_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join("testapiclient", "client.go"))
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	if strings.Contains(clientCode, "Patchable") {
+		t.Error("Regular API should NOT generate Patchable types")
+	}
+	if strings.Contains(clientCode, "MergePatch") {
+		t.Error("Regular API should NOT generate MergePatch type")
+	}
+	if strings.Contains(clientCode, "JSONPatch") {
+		t.Error("Regular API should NOT generate JSONPatch types")
+	}
+	if strings.Contains(clientCode, "WithIfMatch") {
+		t.Error("Regular API should NOT generate WithIfMatch helper")
+	}
+}
+
+// --- Object-wrapped pagination tests ---
+
+// createWrappedPaginationAPI creates a test API with object-wrapped list responses
+func createWrappedPaginationAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Wrapped API", "1.0.0"))
+
+	type Item struct {
+		ID   string `json:"id" doc:"Item ID"`
+		Name string `json:"name" doc:"Item name"`
+	}
+
+	type ListItemsResponse struct {
+		Body struct {
+			Items []Item `json:"items" doc:"The list of items"`
+			Total int    `json:"total" doc:"Total count"`
+			Next  string `json:"next,omitempty" doc:"URL for the next page"`
+		}
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-items",
+		Method:      http.MethodGet,
+		Path:        "/items",
+		Summary:     "List items",
+	}, func(ctx context.Context, input *struct {
+		Limit  int    `query:"limit" doc:"Maximum number of items" default:"10"`
+		Cursor string `query:"cursor" doc:"Pagination cursor"`
+	}) (*ListItemsResponse, error) {
+		return &ListItemsResponse{
+			Body: struct {
+				Items []Item `json:"items" doc:"The list of items"`
+				Total int    `json:"total" doc:"Total count"`
+				Next  string `json:"next,omitempty" doc:"URL for the next page"`
+			}{
+				Items: []Item{{ID: "1", Name: "First"}},
+				Total: 2,
+				Next:  "http://example.com/items?cursor=abc",
+			},
+		}, nil
+	})
+
+	huma.Get(api, "/items/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id"`
+	}) (*struct{ Body Item }, error) {
+		return &struct{ Body Item }{Body: Item{ID: input.ID, Name: "Test"}}, nil
+	})
+
+	return api
+}
+
+// createWrappedPaginationWithLinkAPI creates a test API with object-wrapped responses and Link header
+func createWrappedPaginationWithLinkAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Wrapped Link API", "1.0.0"))
+
+	type Item struct {
+		ID   string `json:"id" doc:"Item ID"`
+		Name string `json:"name" doc:"Item name"`
+	}
+
+	type ListItemsResponse struct {
+		Link string `header:"Link" doc:"Pagination link"`
+		Body struct {
+			Items []Item `json:"items" doc:"The list of items"`
+			Total int    `json:"total" doc:"Total count"`
+		}
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-items",
+		Method:      http.MethodGet,
+		Path:        "/items",
+		Summary:     "List items",
+	}, func(ctx context.Context, input *struct{}) (*ListItemsResponse, error) {
+		return &ListItemsResponse{
+			Body: struct {
+				Items []Item `json:"items" doc:"The list of items"`
+				Total int    `json:"total" doc:"Total count"`
+			}{
+				Items: []Item{{ID: "1", Name: "First"}},
+				Total: 1,
+			},
+		}, nil
+	})
+
+	return api
+}
+
+// createNestedNextFieldAPI creates a test API with nested pagination metadata
+func createNestedNextFieldAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Nested Pagination API", "1.0.0"))
+
+	type Item struct {
+		ID   string `json:"id" doc:"Item ID"`
+		Name string `json:"name" doc:"Item name"`
+	}
+
+	type PaginationMeta struct {
+		Next  string `json:"next,omitempty" doc:"URL for the next page"`
+		Total int    `json:"total" doc:"Total count"`
+	}
+
+	type ListItemsResponse struct {
+		Body struct {
+			Items []Item         `json:"items" doc:"The list of items"`
+			Meta  PaginationMeta `json:"meta" doc:"Pagination metadata"`
+		}
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-items",
+		Method:      http.MethodGet,
+		Path:        "/items",
+		Summary:     "List items",
+	}, func(ctx context.Context, input *struct{}) (*ListItemsResponse, error) {
+		return &ListItemsResponse{
+			Body: struct {
+				Items []Item         `json:"items" doc:"The list of items"`
+				Meta  PaginationMeta `json:"meta" doc:"Pagination metadata"`
+			}{
+				Items: []Item{{ID: "1", Name: "First"}},
+				Meta:  PaginationMeta{Total: 1},
+			},
+		}, nil
+	})
+
+	return api
+}
+
+func TestWrappedPaginationDetection(t *testing.T) {
+	t.Run("DetectsWrappedPaginationWithBodyNext", func(t *testing.T) {
+		api := createWrappedPaginationAPI()
+		openapi := api.OpenAPI()
+
+		pagination := &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		}
+
+		// Check that the list-items operation is detected as paginated
+		found := false
+		for _, pathItem := range openapi.Paths {
+			for _, op := range getOperations(pathItem) {
+				if op.OperationID == "list-items" {
+					if !isPaginatedOperation(op, openapi, pagination) {
+						t.Error("Expected list-items to be detected as paginated with wrapped body + NextField")
+					}
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Fatal("list-items operation not found in API")
+		}
+	})
+
+	t.Run("DetectsWrappedPaginationWithLinkHeader", func(t *testing.T) {
+		api := createWrappedPaginationWithLinkAPI()
+		openapi := api.OpenAPI()
+
+		pagination := &PaginationOptions{
+			ItemsField: "Items",
+		}
+
+		found := false
+		for _, pathItem := range openapi.Paths {
+			for _, op := range getOperations(pathItem) {
+				if op.OperationID == "list-items" {
+					if !isPaginatedOperation(op, openapi, pagination) {
+						t.Error("Expected list-items to be detected as paginated with wrapped body + Link header")
+					}
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Fatal("list-items operation not found in API")
+		}
+	})
+
+	t.Run("RejectsWrappedPaginationWithoutConfig", func(t *testing.T) {
+		api := createWrappedPaginationAPI()
+		openapi := api.OpenAPI()
+
+		// Without pagination config, object-wrapped responses should NOT be detected
+		for _, pathItem := range openapi.Paths {
+			for _, op := range getOperations(pathItem) {
+				if op.OperationID == "list-items" {
+					if isPaginatedOperation(op, openapi, nil) {
+						t.Error("Expected list-items to NOT be detected as paginated without PaginationOptions")
+					}
+				}
+			}
+		}
+	})
+
+	t.Run("RejectsWrongItemsField", func(t *testing.T) {
+		api := createWrappedPaginationAPI()
+		openapi := api.OpenAPI()
+
+		pagination := &PaginationOptions{
+			ItemsField: "Data", // Wrong field name
+			NextField:  "Next",
+		}
+
+		for _, pathItem := range openapi.Paths {
+			for _, op := range getOperations(pathItem) {
+				if op.OperationID == "list-items" {
+					if isPaginatedOperation(op, openapi, pagination) {
+						t.Error("Expected list-items to NOT be detected as paginated with wrong ItemsField")
+					}
+				}
+			}
+		}
+	})
+}
+
+func TestWrappedPaginationCodeGeneration(t *testing.T) {
+	api := createWrappedPaginationAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_wrapped_gen_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	opts := Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("wrappedapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v\n\nGenerated code:\n%s", err, clientCode)
+		}
+	})
+
+	t.Run("HasPaginatorMethod", func(t *testing.T) {
+		if !strings.Contains(clientCode, "ListItemsPaginator") {
+			t.Error("Generated code missing ListItemsPaginator method")
+		}
+	})
+
+	t.Run("HasIterImport", func(t *testing.T) {
+		if !strings.Contains(clientCode, `"iter"`) {
+			t.Error("Generated code missing iter import")
+		}
+	})
+
+	t.Run("PaginatorUsesWrapperType", func(t *testing.T) {
+		// The paginator should use result.Items, not items directly
+		if !strings.Contains(clientCode, "result.Items") {
+			t.Error("Paginator should access items via result.Items")
+		}
+	})
+
+	t.Run("PaginatorChecksBodyNextField", func(t *testing.T) {
+		if !strings.Contains(clientCode, "result.Next") {
+			t.Error("Paginator should check result.Next for body-based pagination")
+		}
+	})
+
+	t.Run("RawMethodReturnsWrapperStruct", func(t *testing.T) {
+		// The raw ListItems method should return the wrapper struct, not []Item
+		if strings.Contains(clientCode, "ListItems(ctx context.Context, opts ...Option) (*http.Response, []Item, error)") {
+			t.Error("Raw method should return wrapper struct, not []Item")
+		}
+	})
+
+	t.Run("NonPaginatedOperationUnaffected", func(t *testing.T) {
+		// GetItemsByID should not have a paginator
+		if strings.Contains(clientCode, "GetItemsByIDPaginator") {
+			t.Error("Non-list operation should not have a paginator method")
+		}
+	})
+}
+
+func TestWrappedPaginationWithLinkHeaderCodeGen(t *testing.T) {
+	api := createWrappedPaginationWithLinkAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_wrapped_link_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	opts := Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+			// No NextField - only Link header
+		},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("wrappedlinkapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v\n\nGenerated code:\n%s", err, clientCode)
+		}
+	})
+
+	t.Run("HasPaginatorUsingLinkHeader", func(t *testing.T) {
+		if !strings.Contains(clientCode, "ListItemsPaginator") {
+			t.Error("Generated code missing ListItemsPaginator method")
+		}
+		if !strings.Contains(clientCode, "parseLinkHeader") {
+			t.Error("Generated code should use parseLinkHeader for Link-based pagination")
+		}
+	})
+}
+
+func TestNestedNextFieldCodeGeneration(t *testing.T) {
+	api := createNestedNextFieldAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_nested_next_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	opts := Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Meta.Next",
+		},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("nestedpaginationapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v\n\nGenerated code:\n%s", err, clientCode)
+		}
+	})
+
+	t.Run("PaginatorUsesNestedFieldAccess", func(t *testing.T) {
+		if !strings.Contains(clientCode, "result.Meta.Next") {
+			t.Error("Paginator should access nested next field via result.Meta.Next")
+		}
+	})
+}
+
+func TestWrappedPaginationIntegration(t *testing.T) {
+	api := createWrappedPaginationAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_wrapped_integration_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	opts := Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	// Create test server that returns paginated object-wrapped responses
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		requestCount++
+
+		switch {
+		case r.URL.Path == "/items" && requestCount == 1:
+			// First page with next URL
+			j, _ := json.Marshal(map[string]any{
+				"items": []map[string]string{
+					{"id": "1", "name": "First"},
+					{"id": "2", "name": "Second"},
+				},
+				"total": 4,
+				"next":  fmt.Sprintf("http://%s/items?cursor=page2", r.Host),
+			})
+			w.Write(j)
+
+		case r.URL.Path == "/items" && requestCount == 2:
+			// Second page with no next URL (last page)
+			j, _ := json.Marshal(map[string]any{
+				"items": []map[string]string{
+					{"id": "3", "name": "Third"},
+					{"id": "4", "name": "Fourth"},
+				},
+				"total": 4,
+			})
+			w.Write(j)
+
+		default:
+			w.WriteHeader(404)
+			w.Write([]byte(`{"detail":"not found"}`))
+		}
+	}))
+	defer server.Close()
+
+	// Create go.mod
+	err = os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	t.Run("BodyBasedPagination", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/wrappedapiclient"
+)
+
+func main() {
+	client := wrappedapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	// Use paginator to collect all items across pages
+	var allItems []map[string]string
+	for item, err := range client.ListItemsPaginator(context.Background()) {
+		if err != nil {
+			fmt.Printf("ERROR: %%v\n", err)
+			os.Exit(1)
+		}
+		allItems = append(allItems, map[string]string{"id": item.ID, "name": item.Name})
+	}
+
+	json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"count": len(allItems),
+		"items": allItems,
+	})
+}
+`, server.URL)
+
+		err := os.WriteFile("test_wrapped_pagination.go", []byte(testProgram), 0644)
+		if err != nil {
+			t.Fatalf("Failed to write test program: %v", err)
+		}
+
+		output, err := runGoProgram("test_wrapped_pagination.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v", err)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse test output: %v\nOutput: %s", err, output)
+		}
+
+		count := int(result["count"].(float64))
+		if count != 4 {
+			t.Errorf("Expected 4 items across pages, got %d", count)
+		}
+
+		items := result["items"].([]any)
+		if items[0].(map[string]any)["id"] != "1" {
+			t.Error("Expected first item to have id=1")
+		}
+		if items[3].(map[string]any)["id"] != "4" {
+			t.Error("Expected fourth item to have id=4")
+		}
+	})
+}
+
+func TestWrappedPaginationWithLinkHeaderIntegration(t *testing.T) {
+	api := createWrappedPaginationWithLinkAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_wrapped_link_int_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	opts := Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+		},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	// Create test server that uses Link header for pagination
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		requestCount++
+
+		switch {
+		case r.URL.Path == "/items" && requestCount == 1:
+			w.Header().Set("Link", fmt.Sprintf(`<%s/items?page=2>; rel="next"`, "http://"+r.Host))
+			j, _ := json.Marshal(map[string]any{
+				"items": []map[string]string{
+					{"id": "1", "name": "First"},
+				},
+				"total": 2,
+			})
+			w.Write(j)
+
+		case r.URL.Path == "/items" && requestCount == 2:
+			// Last page - no Link header
+			j, _ := json.Marshal(map[string]any{
+				"items": []map[string]string{
+					{"id": "2", "name": "Second"},
+				},
+				"total": 2,
+			})
+			w.Write(j)
+
+		default:
+			w.WriteHeader(404)
+			w.Write([]byte(`{"detail":"not found"}`))
+		}
+	}))
+	defer server.Close()
+
+	err = os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	t.Run("LinkHeaderPagination", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/wrappedlinkapiclient"
+)
+
+func main() {
+	client := wrappedlinkapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	var allItems []map[string]string
+	for item, err := range client.ListItemsPaginator(context.Background()) {
+		if err != nil {
+			fmt.Printf("ERROR: %%v\n", err)
+			os.Exit(1)
+		}
+		allItems = append(allItems, map[string]string{"id": item.ID, "name": item.Name})
+	}
+
+	json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"count": len(allItems),
+		"items": allItems,
+	})
+}
+`, server.URL)
+
+		err := os.WriteFile("test_link_pagination.go", []byte(testProgram), 0644)
+		if err != nil {
+			t.Fatalf("Failed to write test program: %v", err)
+		}
+
+		output, err := runGoProgram("test_link_pagination.go")
+		if err != nil {
+			t.Fatalf("Failed to run test program: %v", err)
+		}
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatalf("Failed to parse test output: %v\nOutput: %s", err, output)
+		}
+
+		count := int(result["count"].(float64))
+		if count != 2 {
+			t.Errorf("Expected 2 items across pages, got %d", count)
+		}
+	})
+}
+
+func TestWrappedPaginationLinkPrecedence(t *testing.T) {
+	// Test that Link header takes precedence over body next field
+	api := createWrappedPaginationAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_precedence_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	opts := Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		},
+	}
+
+	err = GenerateClientWithOptions(api, opts)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	// Server that provides both Link header and body next field
+	// Link header points to /items?via=link, body points to /items?via=body
+	requestCount := 0
+	secondRequestVia := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		requestCount++
+
+		if requestCount == 1 {
+			w.Header().Set("Link", fmt.Sprintf(`<%s/items?via=link>; rel="next"`, "http://"+r.Host))
+			j, _ := json.Marshal(map[string]any{
+				"items": []map[string]string{{"id": "1", "name": "First"}},
+				"total": 2,
+				"next":  fmt.Sprintf("http://%s/items?via=body", r.Host),
+			})
+			w.Write(j)
+		} else {
+			secondRequestVia = r.URL.Query().Get("via")
+			j, _ := json.Marshal(map[string]any{
+				"items": []map[string]string{{"id": "2", "name": "Second"}},
+				"total": 2,
+			})
+			w.Write(j)
+		}
+	}))
+	defer server.Close()
+
+	err = os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/wrappedapiclient"
+)
+
+func main() {
+	client := wrappedapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	// Use paginator to iterate all pages, triggering the second request
+	var allItems []map[string]string
+	for item, err := range client.ListItemsPaginator(context.Background()) {
+		if err != nil {
+			fmt.Printf("ERROR: %%v\n", err)
+			os.Exit(1)
+		}
+		allItems = append(allItems, map[string]string{"id": item.ID, "name": item.Name})
+	}
+
+	json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"count": len(allItems),
+		"items": allItems,
+	})
+}
+`, server.URL)
+
+	err = os.WriteFile("test_precedence.go", []byte(testProgram), 0644)
+	if err != nil {
+		t.Fatalf("Failed to write test program: %v", err)
+	}
+
+	output, err := runGoProgram("test_precedence.go")
+	if err != nil {
+		t.Fatalf("Failed to run test program: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("Failed to parse test output: %v\nOutput: %s", err, output)
+	}
+
+	// Verify paginator collected items from both pages
+	if int(result["count"].(float64)) != 2 {
+		t.Errorf("Expected 2 items from paginator, got %v", result["count"])
+	}
+
+	// Verify the second request was made via the Link header, not the body next field
+	if requestCount != 2 {
+		t.Errorf("Expected 2 requests, got %d", requestCount)
+	}
+	if secondRequestVia != "link" {
+		t.Errorf("Expected second request via Link header (via=link), got via=%s", secondRequestVia)
+	}
+}
+
+func TestBackwardCompatibilityArrayPagination(t *testing.T) {
+	// Verify that the original array-based pagination still works when Pagination is nil
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Array API", "1.0.0"))
+
+	type Item struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+
+	type ListItemsResponse struct {
+		Link string `header:"Link" doc:"Pagination link"`
+		Body []Item
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-items",
+		Method:      http.MethodGet,
+		Path:        "/items",
+	}, func(ctx context.Context, input *struct{}) (*ListItemsResponse, error) {
+		return &ListItemsResponse{
+			Body: []Item{{ID: "1", Name: "First"}},
+		}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_compat_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	// Generate WITHOUT PaginationOptions (nil)
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("arrayapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v", err)
+		}
+	})
+
+	t.Run("HasArrayPaginator", func(t *testing.T) {
+		if !strings.Contains(clientCode, "ListItemsPaginator") {
+			t.Error("Expected ListItemsPaginator method for array response with Link header")
+		}
+	})
+
+	t.Run("ReturnsSliceDirectly", func(t *testing.T) {
+		if !strings.Contains(clientCode, "(*http.Response, []Item, error)") {
+			t.Error("Expected array pagination to return []Item directly")
+		}
+	})
+}
+
+// TestNoPaginatorWithoutNextSource verifies that a paginator is NOT generated when
+// the response has an items field but no Link header and the NextField property
+// doesn't exist in the response schema.
+func TestNoPaginatorWithoutNextSource(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("No Next API", "1.0.0"))
+
+	type Item struct {
+		ID   string `json:"id" doc:"Item ID"`
+		Name string `json:"name" doc:"Item name"`
+	}
+
+	// Response has an items field but NO next field and NO Link header
+	type ListItemsResponse struct {
+		Body struct {
+			Items []Item `json:"items" doc:"The list of items"`
+			Total int    `json:"total" doc:"Total count"`
+		}
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-items",
+		Method:      http.MethodGet,
+		Path:        "/items",
+		Summary:     "List items",
+	}, func(ctx context.Context, input *struct{}) (*ListItemsResponse, error) {
+		return &ListItemsResponse{
+			Body: struct {
+				Items []Item `json:"items" doc:"The list of items"`
+				Total int    `json:"total" doc:"Total count"`
+			}{
+				Items: []Item{{ID: "1", Name: "First"}},
+				Total: 1,
+			},
+		}, nil
+	})
+
+	openapi := api.OpenAPI()
+
+	t.Run("DetectionRejectsWithoutNextSource", func(t *testing.T) {
+		// NextField is "Next" globally, but the response schema has no "Next" property
+		pagination := &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		}
+
+		for _, pathItem := range openapi.Paths {
+			for _, op := range getOperations(pathItem) {
+				if op.OperationID == "list-items" {
+					if isPaginatedOperation(op, openapi, pagination) {
+						t.Error("Expected list-items to NOT be detected as paginated when NextField doesn't exist in response schema")
+					}
+				}
+			}
+		}
+	})
+
+	t.Run("CodeGenNoPaginator", func(t *testing.T) {
+		tempDir, err := os.MkdirTemp("", "humaclient_nonext_gen_*")
+		if err != nil {
+			t.Fatalf("Failed to create temp directory: %v", err)
+		}
+		defer os.RemoveAll(tempDir)
+
+		oldDir, _ := os.Getwd()
+		os.Chdir(tempDir)
+		defer os.Chdir(oldDir)
+
+		err = GenerateClientWithOptions(api, Options{
+			Pagination: &PaginationOptions{
+				ItemsField: "Items",
+				NextField:  "Next",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+
+		content, err := os.ReadFile("nonextapiclient/client.go")
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+
+		clientCode := string(content)
+
+		if strings.Contains(clientCode, "Paginator") {
+			t.Error("Expected no Paginator method when response has no next field and no Link header")
+		}
+
+		// Should still generate the ListItems method
+		if !strings.Contains(clientCode, "ListItems(") {
+			t.Error("Expected ListItems method to be generated")
+		}
+	})
+}
+
+// TestNullableArrayItemsInPaginator verifies that nullable (pointer) array items
+// are correctly represented in the generated paginator and struct fields.
+func TestNullableArrayItemsInPaginator(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Nullable Items API", "1.0.0"))
+
+	type ListTimesResponse struct {
+		Link string       `header:"Link" doc:"Pagination link"`
+		Body []*time.Time `json:"body"`
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-times",
+		Method:      http.MethodGet,
+		Path:        "/times",
+		Summary:     "List times",
+	}, func(ctx context.Context, input *struct{}) (*ListTimesResponse, error) {
+		return &ListTimesResponse{}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_nullable_items_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClientWithOptions(api, Options{})
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("nullableitemsapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v", err)
+		}
+	})
+
+	t.Run("PaginatorUsesPointerType", func(t *testing.T) {
+		if !strings.Contains(clientCode, "iter.Seq2[*time.Time, error]") {
+			t.Error("Expected paginator to use *time.Time for nullable items")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+}
+
+// TestNullableArrayItemsInWrappedPaginator verifies pointer items in object-wrapped pagination.
+func TestNullableArrayItemsInWrappedPaginator(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Nullable Wrapped API", "1.0.0"))
+
+	type ListTimesResponse struct {
+		Body struct {
+			Items []*time.Time `json:"items" doc:"List of timestamps"`
+			Next  string       `json:"next,omitempty" doc:"Next page URL"`
+		}
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-times",
+		Method:      http.MethodGet,
+		Path:        "/times",
+		Summary:     "List times",
+	}, func(ctx context.Context, input *struct{}) (*ListTimesResponse, error) {
+		return &ListTimesResponse{}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_nullable_wrapped_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClientWithOptions(api, Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("nullablewrappedapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v", err)
+		}
+	})
+
+	t.Run("PaginatorUsesPointerType", func(t *testing.T) {
+		if !strings.Contains(clientCode, "iter.Seq2[*time.Time, error]") {
+			t.Error("Expected paginator to use *time.Time for nullable wrapped items")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("StructFieldUsesPointerType", func(t *testing.T) {
+		if !strings.Contains(clientCode, "[]*time.Time") {
+			t.Error("Expected struct field to use []*time.Time")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+}
+
+// TestPaginatorItemTypeMatchesStructField verifies that the paginator's item type
+// is always consistent with the struct field's array element type, even for pointer items.
+func TestPaginatorItemTypeMatchesStructField(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Pointer Items API", "1.0.0"))
+
+	type GroupSummary struct {
+		ID   string `json:"id" doc:"Group ID"`
+		Name string `json:"name" doc:"Group name"`
+	}
+
+	// Array response with pointer items and Link header
+	type ListGroupsResponse struct {
+		Link string `header:"Link" doc:"Pagination link"`
+		Body []*GroupSummary
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-groups",
+		Method:      http.MethodGet,
+		Path:        "/groups",
+	}, func(ctx context.Context, input *struct{}) (*ListGroupsResponse, error) {
+		return &ListGroupsResponse{}, nil
+	})
+
+	// Object-wrapped response with pointer items and next field
+	type ListTeamsResponse struct {
+		Body struct {
+			Items []*GroupSummary `json:"items" doc:"List of teams"`
+			Next  string          `json:"next,omitempty" doc:"Next page URL"`
+		}
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-teams",
+		Method:      http.MethodGet,
+		Path:        "/teams",
+	}, func(ctx context.Context, input *struct{}) (*ListTeamsResponse, error) {
+		return &ListTeamsResponse{}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_pointer_items_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClientWithOptions(api, Options{
+		Pagination: &PaginationOptions{
+			ItemsField: "Items",
+			NextField:  "Next",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("pointeritemsapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v", err)
+		}
+	})
+
+	t.Run("PaginatorItemTypeMatchesArrayPagination", func(t *testing.T) {
+		// The paginator's iter.Seq2 type and the yield function must use the same
+		// element type as the array/slice field in the struct. If the struct has
+		// []GroupSummary, the paginator must use GroupSummary. If []*GroupSummary,
+		// it must use *GroupSummary. They must never diverge.
+		if strings.Contains(clientCode, "[]GroupSummary") {
+			if !strings.Contains(clientCode, "iter.Seq2[GroupSummary, error]") {
+				t.Error("Struct uses []GroupSummary but paginator doesn't use GroupSummary")
+				t.Logf("Generated code:\n%s", clientCode)
+			}
+		} else if strings.Contains(clientCode, "[]*GroupSummary") {
+			if !strings.Contains(clientCode, "iter.Seq2[*GroupSummary, error]") {
+				t.Error("Struct uses []*GroupSummary but paginator doesn't use *GroupSummary")
+				t.Logf("Generated code:\n%s", clientCode)
+			}
+		}
+	})
+
+	t.Run("PaginatorItemTypeMatchesWrappedPagination", func(t *testing.T) {
+		// Same consistency check for object-wrapped pagination
+		if strings.Contains(clientCode, "ListTeamsPaginator") {
+			if strings.Contains(clientCode, "[]GroupSummary") {
+				if !strings.Contains(clientCode, "iter.Seq2[GroupSummary, error]") {
+					t.Error("Wrapped struct uses []GroupSummary but paginator doesn't use GroupSummary")
+					t.Logf("Generated code:\n%s", clientCode)
+				}
+			} else if strings.Contains(clientCode, "[]*GroupSummary") {
+				if !strings.Contains(clientCode, "iter.Seq2[*GroupSummary, error]") {
+					t.Error("Wrapped struct uses []*GroupSummary but paginator doesn't use *GroupSummary")
+					t.Logf("Generated code:\n%s", clientCode)
+				}
+			}
+		}
+	})
+}
+
+// TestPointerTypePreservation verifies that pointer types from the original Go
+// structs are faithfully preserved in the generated client code. This covers
+// pointer-to-struct fields, pointer-to-scalar fields, and array items with
+// pointer elements — cases where Huma's schema.Nullable alone is insufficient.
+func TestPointerTypePreservation(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Pointer Preservation API", "1.0.0"))
+
+	type SubThing struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+
+	type Parent struct {
+		// Pointer to struct
+		PtrStruct *SubThing `json:"ptrStruct" doc:"pointer to struct"`
+		// Non-pointer struct
+		ValStruct SubThing `json:"valStruct" doc:"value struct"`
+		// Array of pointer to struct
+		PtrItems []*SubThing `json:"ptrItems" doc:"array of pointer to struct"`
+		// Array of non-pointer struct
+		ValItems []SubThing `json:"valItems" doc:"array of value struct"`
+		// Pointer to string
+		PtrStr *string `json:"ptrStr" doc:"pointer to string"`
+		// Non-pointer string
+		ValStr string `json:"valStr" doc:"value string"`
+		// Pointer to int
+		PtrInt *int64 `json:"ptrInt" doc:"pointer to int"`
+		// Non-pointer int
+		ValInt int64 `json:"valInt" doc:"value int"`
+		// Pointer to bool
+		PtrBool *bool `json:"ptrBool" doc:"pointer to bool"`
+		// Non-pointer bool
+		ValBool bool `json:"valBool" doc:"value bool"`
+		// Pointer to float
+		PtrFloat *float64 `json:"ptrFloat" doc:"pointer to float"`
+		// Non-pointer float
+		ValFloat float64 `json:"valFloat" doc:"value float"`
+	}
+
+	type GetParentResponse struct {
+		Body Parent
+	}
+
+	huma.Get(api, "/parents/{id}", func(ctx context.Context, input *struct {
+		ID string `path:"id"`
+	}) (*GetParentResponse, error) {
+		return &GetParentResponse{}, nil
+	})
+
+	tempDir := t.TempDir()
+
+	err := GenerateClientWithOptions(api, Options{
+		OutputDirectory: tempDir + "/ptrpreserveclient",
+		PackageName:     "ptrpreserveclient",
+	})
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile(tempDir + "/ptrpreserveclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+
+	clientCode := string(content)
+
+	// Normalize whitespace for matching (gofmt aligns struct fields with tabs/spaces)
+	normalized := regexp.MustCompile(`\s+`).ReplaceAllString(clientCode, " ")
+
+	t.Run("ValidGoSyntax", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", content, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("Generated code has syntax errors: %v", err)
+		}
+	})
+
+	t.Run("PointerStructField", func(t *testing.T) {
+		if !strings.Contains(normalized, "PtrStruct *SubThing") {
+			t.Error("Expected PtrStruct to use pointer type *SubThing")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("ValueStructField", func(t *testing.T) {
+		if !strings.Contains(normalized, "ValStruct SubThing") {
+			t.Error("Expected ValStruct to use value type SubThing")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("PointerArrayItems", func(t *testing.T) {
+		if !strings.Contains(normalized, "PtrItems []*SubThing") {
+			t.Error("Expected PtrItems to use []*SubThing")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("ValueArrayItems", func(t *testing.T) {
+		if !strings.Contains(normalized, "ValItems []SubThing") {
+			t.Error("Expected ValItems to use []SubThing")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("PointerStringField", func(t *testing.T) {
+		if !strings.Contains(normalized, "PtrStr *string") {
+			t.Error("Expected PtrStr to use *string")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("ValueStringField", func(t *testing.T) {
+		if strings.Contains(normalized, "ValStr *string") {
+			t.Error("Expected ValStr to use string, not *string")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("PointerIntField", func(t *testing.T) {
+		if !strings.Contains(normalized, "PtrInt *int64") {
+			t.Error("Expected PtrInt to use *int64")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("ValueIntField", func(t *testing.T) {
+		if strings.Contains(normalized, "ValInt *int64") {
+			t.Error("Expected ValInt to use int64, not *int64")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("PointerBoolField", func(t *testing.T) {
+		if !strings.Contains(normalized, "PtrBool *bool") {
+			t.Error("Expected PtrBool to use *bool")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("ValueBoolField", func(t *testing.T) {
+		if strings.Contains(normalized, "ValBool *bool") {
+			t.Error("Expected ValBool to use bool, not *bool")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("PointerFloatField", func(t *testing.T) {
+		if !strings.Contains(normalized, "PtrFloat *float64") {
+			t.Error("Expected PtrFloat to use *float64")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
+	})
+
+	t.Run("ValueFloatField", func(t *testing.T) {
+		if strings.Contains(normalized, "ValFloat *float64") {
+			t.Error("Expected ValFloat to use float64, not *float64")
+			t.Logf("Generated code:\n%s", clientCode)
+		}
 	})
 }
