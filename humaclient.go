@@ -559,6 +559,8 @@ func buildHumaTags(schema *huma.Schema) string {
 	// Format
 	if schema.Format != "" {
 		tags = append(tags, fmt.Sprintf("format:\"%s\"", schema.Format))
+	} else if schema.Type == "array" && schema.Items != nil && schema.Items.Format != "" {
+		tags = append(tags, fmt.Sprintf("format:\"%s\"", schema.Items.Format))
 	}
 
 	// Example/Examples
@@ -588,6 +590,7 @@ func buildHumaTags(schema *huma.Schema) string {
 	if len(tags) > 0 {
 		return " " + strings.Join(tags, " ")
 	}
+
 	return ""
 }
 
