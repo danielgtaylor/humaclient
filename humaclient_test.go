@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danielgtaylor/casing"
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"github.com/danielgtaylor/huma/v2/casing"
 )
 
 // Test models with comprehensive validation tags
@@ -2556,13 +2556,13 @@ require github.com/danielgtaylor/huma/v2 v2.15.0
 	})
 
 	t.Run("UsesUnqualifiedTypesForSelfImports", func(t *testing.T) {
-		outputDir := "myapiclient" 
-		
+		outputDir := "myapiclient"
+
 		opts := Options{
 			PackageName:     "myapiclient",
 			OutputDirectory: outputDir,
 			AllowedPackages: []string{
-				"example.com/myapi/myapiclient",  // Self-import - types should be unqualified
+				"example.com/myapi/myapiclient",    // Self-import - types should be unqualified
 				"github.com/danielgtaylor/huma/v2", // External import - types should be qualified
 			},
 		}
