@@ -2604,6 +2604,124 @@ require github.com/danielgtaylor/huma/v2 v2.15.0
 	})
 }
 
+func TestRequestBodyNilCheckRemoval(t *testing.T) {
+	t.Run("RequiredBodyOmitsNilCheck", func(t *testing.T) {
+		api := createTestAPI()
+		
+		tempDir, err := os.MkdirTemp("", "humaclient_nilcheck_test_*")
+		if err != nil {
+			t.Fatalf("Failed to create temp directory: %v", err)
+		}
+		defer os.RemoveAll(tempDir)
+		
+		oldDir, _ := os.Getwd()
+		os.Chdir(tempDir)
+		defer os.Chdir(oldDir)
+		
+		err = GenerateClient(api)
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+		
+		content, err := os.ReadFile("testapiclient/client.go")
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+		
+		code := string(content)
+		
+		// Check that POST operation (with required body) does NOT have nil check
+		// It should set Content-Type unconditionally
+		postIdx := strings.Index(code, "func (c *TestAPIClientImpl) PostThings")
+		if postIdx == -1 {
+			t.Fatal("Could not find PostThings method in generated code")
+		}
+		
+		// Find the next function after PostThings to bound our search
+		nextFuncIdx := strings.Index(code[postIdx+100:], "\nfunc ")
+		if nextFuncIdx == -1 {
+			nextFuncIdx = len(code)
+		} else {
+			nextFuncIdx = postIdx + 100 + nextFuncIdx
+		}
+		
+		postMethod := code[postIdx:nextFuncIdx]
+		
+		// Should NOT have "if reqBody != nil"
+		if strings.Contains(postMethod, "if reqBody != nil") {
+			t.Error("POST method with required body should not have nil check for reqBody")
+		}
+		
+		// Should have unconditional Content-Type setting
+		if !strings.Contains(postMethod, `req.Header.Set("Content-Type", "application/json")`) {
+			t.Error("POST method should set Content-Type unconditionally")
+		}
+		
+		t.Logf("Successfully verified POST method does not have unnecessary nil check")
+	})
+	
+	t.Run("OptionalBodyKeepsNilCheck", func(t *testing.T) {
+		api := createTestAPI()
+		
+		tempDir, err := os.MkdirTemp("", "humaclient_nilcheck_test_*")
+		if err != nil {
+			t.Fatalf("Failed to create temp directory: %v", err)
+		}
+		defer os.RemoveAll(tempDir)
+		
+		oldDir, _ := os.Getwd()
+		os.Chdir(tempDir)
+		defer os.Chdir(oldDir)
+		
+		err = GenerateClient(api)
+		if err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+		
+		content, err := os.ReadFile("testapiclient/client.go")
+		if err != nil {
+			t.Fatalf("Failed to read generated client: %v", err)
+		}
+		
+		code := string(content)
+		
+		// Check that Follow method (with optional body) DOES have nil check
+		followIdx := strings.Index(code, "func (c *TestAPIClientImpl) Follow")
+		if followIdx == -1 {
+			t.Fatal("Could not find Follow method in generated code")
+		}
+		
+		// Find the end of Follow method
+		nextFuncIdx := strings.Index(code[followIdx+100:], "\nfunc ")
+		if nextFuncIdx == -1 {
+			nextFuncIdx = len(code)
+		} else {
+			nextFuncIdx = followIdx + 100 + nextFuncIdx
+		}
+		
+		followMethod := code[followIdx:nextFuncIdx]
+		
+		// Should have "if reqBody != nil"
+		if !strings.Contains(followMethod, "if reqBody != nil") {
+			t.Error("Follow method with optional body should have nil check for reqBody")
+		}
+		
+		// Should have conditional Content-Type setting inside the nil check
+		nilCheckIdx := strings.Index(followMethod, "if reqBody != nil")
+		contentTypeIdx := strings.Index(followMethod, `req.Header.Set("Content-Type", "application/json")`)
+		
+		if nilCheckIdx == -1 || contentTypeIdx == -1 {
+			t.Fatal("Expected both nil check and Content-Type setting")
+		}
+		
+		if contentTypeIdx < nilCheckIdx {
+			t.Error("Content-Type should be set inside the nil check for optional body")
+		}
+		
+		t.Logf("Successfully verified Follow method keeps nil check for optional body")
+	})
+}
+
 // createAutopatchTestAPI creates a test API that simulates Huma's autopatch behavior:
 // a GET + PUT pair with a PATCH operation registered using application/merge-patch+json.
 func createAutopatchTestAPI() huma.API {

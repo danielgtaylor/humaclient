@@ -1687,15 +1687,15 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 	}
 
 	// Set content type and apply custom headers
-{{- if or .HasRequestBody .HasOptionalBody}}
-	if reqBody != nil {
+{{- if .HasRequestBody}}
 {{- if .IsMergePatch}}
-		if body != nil {
-			req.Header.Set("Content-Type", body.PatchContentType())
-		}
+	req.Header.Set("Content-Type", body.PatchContentType())
 {{- else}}
-		req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/json")
 {{- end}}
+{{- else if .HasOptionalBody}}
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 {{- end}}
 	reqOpts.applyHeaders(req)
