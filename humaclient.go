@@ -12,8 +12,8 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/danielgtaylor/casing"
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/casing"
 )
 
 // PaginationOptions configures how wrapped list responses are paginated.

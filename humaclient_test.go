@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danielgtaylor/casing"
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"github.com/danielgtaylor/huma/v2/casing"
 )
 
 // Test models with comprehensive validation tags
