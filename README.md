@@ -8,6 +8,7 @@ A library to generate simple clients in Go for interacting with [Huma](https://g
 - Built-in support for paginated responses via `Link` headers with `rel=next`.
 - Support for Huma's autopatch PATCH operations via `Patchable` interface with `MergePatch` and `JSONPatch` types.
 - Conditional request helpers (`WithIfMatch`, `WithIfNoneMatch`) for ETag-based optimistic locking.
+- Pagination support for object-wrapped list responses with configurable items and next-page fields.
 
 These are _not_ supported:
 
@@ -266,6 +267,59 @@ for item, err := range client.ListThingsPaginator(ctx) {
 	fmt.Println(item)
 }
 ```
+
+#### Object-Wrapped List Responses
+
+Many APIs return list responses wrapped in an object with additional metadata rather than as a plain JSON array:
+
+```json
+{
+  "items": [{"id": "1", "name": "Thing 1"}, {"id": "2", "name": "Thing 2"}],
+  "total": 42,
+  "next": "https://api.example.com/things?cursor=abc123"
+}
+```
+
+To support this, configure `PaginationOptions` when registering your API:
+
+```go
+humaclient.RegisterWithOptions(api, humaclient.Options{
+	Pagination: &humaclient.PaginationOptions{
+		// Go struct field name containing the items array (required)
+		ItemsField: "Items",
+		// Go struct field path containing the next-page URL (optional)
+		NextField:  "Next",
+	},
+})
+```
+
+The generated raw method returns the full wrapper struct, giving you access to all metadata:
+
+```go
+resp, result, err := client.ListThings(ctx)
+fmt.Println(result.Items) // the items
+fmt.Println(result.Total) // additional metadata
+fmt.Println(result.Next)  // next page URL
+```
+
+The paginator automatically unwraps items and handles pagination transparently:
+
+```go
+for item, err := range client.ListThingsPaginator(ctx) {
+	if err != nil {
+		fmt.Println("Error:", err)
+		break
+	}
+	fmt.Println(item)
+}
+```
+
+**Configuration options:**
+
+- `ItemsField` (required): The Go struct field name of the array field (e.g. `"Items"`, `"Data"`, `"Results"`). Must be a root-level field.
+- `NextField` (optional): The Go struct field path for the next-page URL. Supports dot-separated paths for nested fields (e.g. `"Next"`, `"Meta.Next"`, `"Pagination.NextURL"`). When set, enables body-based pagination.
+
+When both a `Link` header and a body next-page field are available, the `Link` header takes precedence. If `Pagination` is nil (the default), only array responses with `Link` headers are treated as paginated, preserving backward compatibility.
 
 ### Following Links
 
