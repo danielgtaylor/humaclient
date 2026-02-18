@@ -53,7 +53,7 @@ type ClientTemplateData struct {
 	Operations          []OperationData
 	RequestOptionFields []OptionField
 	HasRequestBodies    bool
-	HasMergePatch       bool // Whether any operation uses merge-patch content type
+	HasMergePatch       bool // Whether any operation supports both merge-patch+json and json-patch+json (autopatch)
 	HasJSONPatchOp      bool // Whether JSONPatchOp already exists as a schema struct
 }
 
@@ -94,7 +94,7 @@ type OperationData struct {
 	OptionsFields     []OptionField
 	IsPaginated       bool
 	ItemType          string
-	IsMergePatch      bool   // Whether this operation uses application/merge-patch+json
+	IsMergePatch      bool   // Whether this operation has both merge-patch and json-patch media types (autopatch detection)
 	ItemsField        string // Go struct field name for items array in wrapped responses (e.g. "Items")
 	NextField         string // Go struct field path for next-page URL (e.g. "Next" or "Meta.Next")
 	NextFieldNilCheck string // Nil-check expression for nullable intermediate fields in NextField path
