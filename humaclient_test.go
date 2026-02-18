@@ -36,6 +36,7 @@ type TestThing struct {
 	WriteOnlyToken  string    `json:"writeOnlyToken" writeOnly:"true" doc:"Write-only token"`
 	DeprecatedField string    `json:"deprecatedField" deprecated:"true" doc:"Deprecated field"`
 	CreatedAt       time.Time `json:"createdAt" format:"date-time"`
+	UUIDs           []string  `json:"uuids" format:"uuid"`
 }
 
 type GetThingResponse struct {
@@ -885,6 +886,11 @@ func TestValidationTagsPreservation(t *testing.T) {
 		if !strings.Contains(clientCode, test.tag) {
 			t.Errorf("Generated code missing %s (%s)", test.description, test.tag)
 		}
+	}
+
+	// Test specific case for array items format (e.g. format:"uuid" on []string)
+	if !strings.Contains(clientCode, "Uuids           []string  `json:\"uuids\" format:\"uuid\"`") {
+		t.Errorf("Generated code missing format tag for array field Uuids")
 	}
 }
 
