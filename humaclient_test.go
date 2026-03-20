@@ -23,6 +23,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"github.com/danielgtaylor/huma/v2/casing"
+	humaSSE "github.com/danielgtaylor/huma/v2/sse"
 )
 
 // Test models with comprehensive validation tags
@@ -2613,36 +2614,36 @@ require github.com/danielgtaylor/huma/v2 v2.15.0
 func TestRequestBodyNilCheckRemoval(t *testing.T) {
 	t.Run("RequiredBodyOmitsNilCheck", func(t *testing.T) {
 		api := createTestAPI()
-		
+
 		tempDir, err := os.MkdirTemp("", "humaclient_nilcheck_test_*")
 		if err != nil {
 			t.Fatalf("Failed to create temp directory: %v", err)
 		}
 		defer os.RemoveAll(tempDir)
-		
+
 		oldDir, _ := os.Getwd()
 		os.Chdir(tempDir)
 		defer os.Chdir(oldDir)
-		
+
 		err = GenerateClient(api)
 		if err != nil {
 			t.Fatalf("Failed to generate client: %v", err)
 		}
-		
+
 		content, err := os.ReadFile("testapiclient/client.go")
 		if err != nil {
 			t.Fatalf("Failed to read generated client: %v", err)
 		}
-		
+
 		code := string(content)
-		
+
 		// Check that POST operation (with required body) does NOT have nil check
 		// It should set Content-Type unconditionally
 		postIdx := strings.Index(code, "func (c *TestAPIClientImpl) PostThings")
 		if postIdx == -1 {
 			t.Fatal("Could not find PostThings method in generated code")
 		}
-		
+
 		// Find the next function after PostThings to bound our search
 		nextFuncIdx := strings.Index(code[postIdx+100:], "\nfunc ")
 		if nextFuncIdx == -1 {
@@ -2650,53 +2651,53 @@ func TestRequestBodyNilCheckRemoval(t *testing.T) {
 		} else {
 			nextFuncIdx = postIdx + 100 + nextFuncIdx
 		}
-		
+
 		postMethod := code[postIdx:nextFuncIdx]
-		
+
 		// Should NOT have "if reqBody != nil"
 		if strings.Contains(postMethod, "if reqBody != nil") {
 			t.Error("POST method with required body should not have nil check for reqBody")
 		}
-		
+
 		// Should have unconditional Content-Type setting
 		if !strings.Contains(postMethod, `req.Header.Set("Content-Type", "application/json")`) {
 			t.Error("POST method should set Content-Type unconditionally")
 		}
-		
+
 		t.Logf("Successfully verified POST method does not have unnecessary nil check")
 	})
-	
+
 	t.Run("OptionalBodyKeepsNilCheck", func(t *testing.T) {
 		api := createTestAPI()
-		
+
 		tempDir, err := os.MkdirTemp("", "humaclient_nilcheck_test_*")
 		if err != nil {
 			t.Fatalf("Failed to create temp directory: %v", err)
 		}
 		defer os.RemoveAll(tempDir)
-		
+
 		oldDir, _ := os.Getwd()
 		os.Chdir(tempDir)
 		defer os.Chdir(oldDir)
-		
+
 		err = GenerateClient(api)
 		if err != nil {
 			t.Fatalf("Failed to generate client: %v", err)
 		}
-		
+
 		content, err := os.ReadFile("testapiclient/client.go")
 		if err != nil {
 			t.Fatalf("Failed to read generated client: %v", err)
 		}
-		
+
 		code := string(content)
-		
+
 		// Check that Follow method (with optional body) DOES have nil check
 		followIdx := strings.Index(code, "func (c *TestAPIClientImpl) Follow")
 		if followIdx == -1 {
 			t.Fatal("Could not find Follow method in generated code")
 		}
-		
+
 		// Find the end of Follow method
 		nextFuncIdx := strings.Index(code[followIdx+100:], "\nfunc ")
 		if nextFuncIdx == -1 {
@@ -2704,26 +2705,26 @@ func TestRequestBodyNilCheckRemoval(t *testing.T) {
 		} else {
 			nextFuncIdx = followIdx + 100 + nextFuncIdx
 		}
-		
+
 		followMethod := code[followIdx:nextFuncIdx]
-		
+
 		// Should have "if reqBody != nil"
 		if !strings.Contains(followMethod, "if reqBody != nil") {
 			t.Error("Follow method with optional body should have nil check for reqBody")
 		}
-		
+
 		// Should have conditional Content-Type setting inside the nil check
 		nilCheckIdx := strings.Index(followMethod, "if reqBody != nil")
 		contentTypeIdx := strings.Index(followMethod, `req.Header.Set("Content-Type", "application/json")`)
-		
+
 		if nilCheckIdx == -1 || contentTypeIdx == -1 {
 			t.Fatal("Expected both nil check and Content-Type setting")
 		}
-		
+
 		if contentTypeIdx < nilCheckIdx {
 			t.Error("Content-Type should be set inside the nil check for optional body")
 		}
-		
+
 		t.Logf("Successfully verified Follow method keeps nil check for optional body")
 	})
 }
@@ -4544,4 +4545,491 @@ func TestPointerTypePreservation(t *testing.T) {
 			t.Logf("Generated code:\n%s", clientCode)
 		}
 	})
+}
+
+// SSE test types
+type UserCreatedEvent struct {
+	UserID   int    `json:"user_id"`
+	Username string `json:"username"`
+}
+
+type UserDeletedEvent struct {
+	UserID int `json:"user_id"`
+}
+
+type StatusMessage struct {
+	Message string `json:"message"`
+}
+
+func createSSETestAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("SSE Test API", "1.0.0"))
+
+	humaSSE.Register(api, huma.Operation{
+		OperationID: "watch-events",
+		Method:      http.MethodGet,
+		Path:        "/events",
+	}, map[string]any{
+		"userCreate": UserCreatedEvent{},
+		"userDelete": UserDeletedEvent{},
+		"message":    StatusMessage{},
+	}, func(ctx context.Context, input *struct{}, send humaSSE.Sender) {
+		send(humaSSE.Message{Data: StatusMessage{Message: "connected"}})
+		send(humaSSE.Message{
+			ID:   1,
+			Data: UserCreatedEvent{UserID: 42, Username: "alice"},
+		})
+		send(humaSSE.Message{
+			Data: UserDeletedEvent{UserID: 7},
+		})
+	})
+
+	// Also register a normal JSON endpoint to ensure it's unaffected
+	huma.Get(api, "/health", func(ctx context.Context, input *struct{}) (*struct{ Body struct{ Status string } }, error) {
+		return &struct{ Body struct{ Status string } }{Body: struct{ Status string }{Status: "ok"}}, nil
+	})
+
+	return api
+}
+
+func TestSSEDetection(t *testing.T) {
+	api := createSSETestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_sse_detection_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	clientCode, err := os.ReadFile(filepath.Join("ssetestapiclient", "client.go"))
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+	code := string(clientCode)
+
+	t.Run("SSEEventStructGenerated", func(t *testing.T) {
+		if !strings.Contains(code, "type SSEEvent struct") {
+			t.Error("Expected SSEEvent struct to be generated")
+		}
+	})
+
+	t.Run("ParseSSEStreamGenerated", func(t *testing.T) {
+		if !strings.Contains(code, "func parseSSEStream(") {
+			t.Error("Expected parseSSEStream function to be generated")
+		}
+	})
+
+	t.Run("BaseMethodGenerated", func(t *testing.T) {
+		if !strings.Contains(code, "func (c *SSETestAPIClientImpl) WatchEvents(ctx context.Context") {
+			t.Error("Expected WatchEvents base method to be generated")
+			t.Logf("Generated code:\n%s", code)
+		}
+	})
+
+	t.Run("StreamMethodGenerated", func(t *testing.T) {
+		if !strings.Contains(code, "func (c *SSETestAPIClientImpl) WatchEventsStream(ctx context.Context") {
+			t.Error("Expected WatchEventsStream method to be generated")
+			t.Logf("Generated code:\n%s", code)
+		}
+	})
+
+	t.Run("InterfaceHasBothMethods", func(t *testing.T) {
+		if !strings.Contains(code, "WatchEvents(ctx context.Context") {
+			t.Error("Expected WatchEvents in interface")
+		}
+		if !strings.Contains(code, "WatchEventsStream(ctx context.Context") {
+			t.Error("Expected WatchEventsStream in interface")
+		}
+	})
+
+	t.Run("UnmarshalFunctionGenerated", func(t *testing.T) {
+		if !strings.Contains(code, "func unmarshalWatchEventsData(") {
+			t.Error("Expected unmarshalWatchEventsData function to be generated")
+			t.Logf("Generated code:\n%s", code)
+		}
+	})
+
+	t.Run("EventTypeStructsGenerated", func(t *testing.T) {
+		if !strings.Contains(code, "type UserCreatedEvent struct") {
+			t.Error("Expected UserCreatedEvent struct to be generated")
+		}
+		if !strings.Contains(code, "type UserDeletedEvent struct") {
+			t.Error("Expected UserDeletedEvent struct to be generated")
+		}
+		if !strings.Contains(code, "type StatusMessage struct") {
+			t.Error("Expected StatusMessage struct to be generated")
+		}
+	})
+
+	t.Run("BufioImported", func(t *testing.T) {
+		if !strings.Contains(code, "\"bufio\"") {
+			t.Error("Expected bufio import for SSE parsing")
+		}
+	})
+
+	t.Run("NonSSEEndpointUnaffected", func(t *testing.T) {
+		// The health endpoint should still have a normal JSON response body
+		if !strings.Contains(code, "GetHealth(ctx context.Context") {
+			t.Error("Expected GetHealth method to be generated normally")
+			t.Logf("Generated code:\n%s", code)
+		}
+	})
+
+	t.Run("GeneratedCodeCompiles", func(t *testing.T) {
+		fset := token.NewFileSet()
+		_, err := parser.ParseFile(fset, "client.go", code, parser.AllErrors)
+		if err != nil {
+			t.Errorf("Generated code has syntax errors: %v", err)
+			t.Logf("Generated code:\n%s", code)
+		}
+	})
+
+	t.Run("BaseMethodDoesNotCloseBody", func(t *testing.T) {
+		// The WatchEvents base method should NOT have defer resp.Body.Close()
+		// because it returns (*http.Response, error) with no JSON body
+		// Find the WatchEvents method and check it doesn't close the body on success path
+		// The method has HasResponseBody=false, so the template should not emit defer
+		methodIdx := strings.Index(code, "func (c *SSETestAPIClientImpl) WatchEvents(ctx context.Context")
+		if methodIdx == -1 {
+			t.Fatal("Could not find WatchEvents method")
+		}
+		// Find the next method after WatchEvents
+		nextMethodIdx := strings.Index(code[methodIdx+1:], "\nfunc ")
+		var methodCode string
+		if nextMethodIdx == -1 {
+			methodCode = code[methodIdx:]
+		} else {
+			methodCode = code[methodIdx : methodIdx+1+nextMethodIdx]
+		}
+		// We expect exactly one defer inside the error block (StatusCode >= 400)
+		// but not a top-level defer before the error check
+		deferCount := strings.Count(methodCode, "defer resp.Body.Close()")
+		if deferCount != 1 {
+			t.Errorf("Expected exactly 1 defer resp.Body.Close() (in error path), got %d", deferCount)
+			t.Logf("WatchEvents method:\n%s", methodCode)
+		}
+	})
+}
+
+func TestSSEBehavior(t *testing.T) {
+	api := createSSETestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_sse_behavior_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	// Create a test SSE server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/events":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "streaming not supported", http.StatusInternalServerError)
+				return
+			}
+
+			// Send events
+			fmt.Fprintf(w, "data: {\"message\":\"connected\"}\n\n")
+			flusher.Flush()
+
+			fmt.Fprintf(w, "id: 1\nevent: userCreate\ndata: {\"user_id\":42,\"username\":\"alice\"}\n\n")
+			flusher.Flush()
+
+			fmt.Fprintf(w, "event: userDelete\ndata: {\"user_id\":7}\n\n")
+			flusher.Flush()
+
+		case r.Method == "GET" && r.URL.Path == "/health":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"ok"}`))
+
+		default:
+			w.WriteHeader(404)
+			w.Write([]byte(`{"detail":"not found"}`))
+		}
+	}))
+	defer server.Close()
+
+	os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644)
+
+	t.Run("StreamIterator", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/ssetestapiclient"
+)
+
+func main() {
+	client := ssetestapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	var events []map[string]any
+	for event, err := range client.WatchEventsStream(context.Background()) {
+		if err != nil {
+			fmt.Printf("ERROR: %%v\n", err)
+			os.Exit(1)
+		}
+		eventMap := map[string]any{
+			"type":  event.Type,
+			"id":    event.ID,
+			"retry": event.Retry,
+		}
+		// Type-switch to verify pre-unmarshaled data
+		switch data := event.Data.(type) {
+		case ssetestapiclient.StatusMessage:
+			eventMap["dataType"] = "StatusMessage"
+			eventMap["message"] = data.Message
+		case ssetestapiclient.UserCreatedEvent:
+			eventMap["dataType"] = "UserCreatedEvent"
+			eventMap["userId"] = data.UserID
+			eventMap["username"] = data.Username
+		case ssetestapiclient.UserDeletedEvent:
+			eventMap["dataType"] = "UserDeletedEvent"
+			eventMap["userId"] = data.UserID
+		default:
+			eventMap["dataType"] = "unknown"
+		}
+		events = append(events, eventMap)
+	}
+
+	j, _ := json.Marshal(events)
+	fmt.Println(string(j))
+}
+`, server.URL)
+		err := os.WriteFile("main.go", []byte(testProgram), 0644)
+		if err != nil {
+			t.Fatalf("Failed to write test program: %v", err)
+		}
+
+		output, err := runGoProgram("main.go")
+		if err != nil {
+			t.Fatalf("Test program failed: %v", err)
+		}
+
+		var events []map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &events); err != nil {
+			t.Fatalf("Failed to parse output: %v\nOutput: %s", err, output)
+		}
+
+		if len(events) != 3 {
+			t.Fatalf("Expected 3 events, got %d: %s", len(events), output)
+		}
+
+		// Event 1: default "message" type with StatusMessage data
+		if events[0]["type"] != "" {
+			t.Errorf("Event 0: expected empty type (message default), got %q", events[0]["type"])
+		}
+		if events[0]["dataType"] != "StatusMessage" {
+			t.Errorf("Event 0: expected StatusMessage data type, got %v", events[0]["dataType"])
+		}
+		if events[0]["message"] != "connected" {
+			t.Errorf("Event 0: expected message 'connected', got %v", events[0]["message"])
+		}
+
+		// Event 2: userCreate with ID
+		if events[1]["type"] != "userCreate" {
+			t.Errorf("Event 1: expected type 'userCreate', got %q", events[1]["type"])
+		}
+		if events[1]["dataType"] != "UserCreatedEvent" {
+			t.Errorf("Event 1: expected UserCreatedEvent data type, got %v", events[1]["dataType"])
+		}
+		if events[1]["id"] != "1" {
+			t.Errorf("Event 1: expected id '1', got %v", events[1]["id"])
+		}
+		if events[1]["username"] != "alice" {
+			t.Errorf("Event 1: expected username 'alice', got %v", events[1]["username"])
+		}
+
+		// Event 3: userDelete
+		if events[2]["type"] != "userDelete" {
+			t.Errorf("Event 2: expected type 'userDelete', got %q", events[2]["type"])
+		}
+		if events[2]["dataType"] != "UserDeletedEvent" {
+			t.Errorf("Event 2: expected UserDeletedEvent data type, got %v", events[2]["dataType"])
+		}
+	})
+
+	t.Run("RawMethod", func(t *testing.T) {
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/ssetestapiclient"
+)
+
+func main() {
+	client := ssetestapiclient.NewWithClient("%s", &http.Client{
+		Timeout: time.Second * 5,
+	})
+
+	resp, err := client.WatchEvents(context.Background())
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	// Verify we can read the raw body
+	scanner := bufio.NewScanner(resp.Body)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	fmt.Printf("STATUS: %%d\n", resp.StatusCode)
+	fmt.Printf("CONTENT-TYPE: %%s\n", resp.Header.Get("Content-Type"))
+	fmt.Printf("LINES: %%d\n", len(lines))
+}
+`, server.URL)
+		err := os.WriteFile("main_raw.go", []byte(testProgram), 0644)
+		if err != nil {
+			t.Fatalf("Failed to write test program: %v", err)
+		}
+
+		output, err := runGoProgram("main_raw.go")
+		if err != nil {
+			t.Fatalf("Test program failed: %v", err)
+		}
+
+		if !strings.Contains(output, "STATUS: 200") {
+			t.Errorf("Expected status 200, got: %s", output)
+		}
+		if !strings.Contains(output, "CONTENT-TYPE: text/event-stream") {
+			t.Errorf("Expected text/event-stream content type, got: %s", output)
+		}
+	})
+
+	t.Run("ContextCancellation", func(t *testing.T) {
+		// Create a server that sends events slowly so we can cancel mid-stream
+		slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			fmt.Fprintf(w, "data: {\"message\":\"first\"}\n\n")
+			flusher.Flush()
+			// Block until client disconnects
+			<-r.Context().Done()
+		}))
+		defer slowServer.Close()
+
+		testProgram := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/ssetestapiclient"
+)
+
+func main() {
+	client := ssetestapiclient.NewWithClient("%s", &http.Client{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	count := 0
+	for _, err := range client.WatchEventsStream(ctx) {
+		if err != nil {
+			// Expected: context deadline or read error after cancellation
+			fmt.Println("GOT_ERROR")
+			break
+		}
+		count++
+	}
+	fmt.Printf("EVENTS: %%d\n", count)
+	os.Exit(0)
+}
+`, slowServer.URL)
+		err := os.WriteFile("main_cancel.go", []byte(testProgram), 0644)
+		if err != nil {
+			t.Fatalf("Failed to write test program: %v", err)
+		}
+
+		output, err := runGoProgram("main_cancel.go")
+		if err != nil {
+			t.Fatalf("Test program failed: %v", err)
+		}
+
+		if !strings.Contains(output, "EVENTS: 1") {
+			t.Errorf("Expected 1 event before cancellation, got: %s", output)
+		}
+	})
+}
+
+func TestNonSSEClientUnchanged(t *testing.T) {
+	// Generate a client with NO SSE endpoints and verify no SSE code is present
+	api := createTestAPI()
+
+	tempDir, err := os.MkdirTemp("", "humaclient_no_sse_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	err = GenerateClient(api)
+	if err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	clientCode, err := os.ReadFile(filepath.Join("testapiclient", "client.go"))
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+	code := string(clientCode)
+
+	if strings.Contains(code, "SSEEvent") {
+		t.Error("Non-SSE client should not contain SSEEvent struct")
+	}
+	if strings.Contains(code, "parseSSEStream") {
+		t.Error("Non-SSE client should not contain parseSSEStream function")
+	}
+	if strings.Contains(code, "\"bufio\"") {
+		t.Error("Non-SSE client should not import bufio")
+	}
+	if strings.Contains(code, "\"strconv\"") {
+		t.Error("Non-SSE client should not import strconv")
+	}
 }
