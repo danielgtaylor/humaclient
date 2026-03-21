@@ -171,6 +171,11 @@ func parseSSEStream(r io.Reader, unmarshal func(string, []byte) (any, error)) it
 
 		for scanner.Scan() {
 			line := scanner.Text()
+			// Per SSE spec, lines may end with CR, LF, or CRLF. bufio.Scanner
+			// splits on LF, so trim any trailing CR from CRLF endings.
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
 
 			if line == "" {
 				// Blank line: emit event if we have data

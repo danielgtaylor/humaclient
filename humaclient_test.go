@@ -4773,7 +4773,9 @@ func TestSSEBehavior(t *testing.T) {
 	}))
 	defer server.Close()
 
-	os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644)
+	if err := os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644); err != nil {
+		t.Fatalf("Failed to write go.mod: %v", err)
+	}
 
 	t.Run("StreamIterator", func(t *testing.T) {
 		testProgram := fmt.Sprintf(`
