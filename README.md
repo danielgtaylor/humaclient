@@ -9,11 +9,12 @@ A library to generate simple clients in Go for interacting with [Huma](https://g
 - Support for Huma's autopatch PATCH operations via `Patchable` interface with `MergePatch` and `JSONPatch` types.
 - Conditional request helpers (`WithIfMatch`, `WithIfNoneMatch`) for ETag-based optimistic locking.
 - Pagination support for object-wrapped list responses with configurable items and next-page fields.
+- Server-Sent Events (SSE) streaming with typed event discrimination and iterator support.
 
 These are _not_ supported:
 
 - Union types `oneOf`, `anyOf`, and `type` arrays other than nullable types.
-- Non-JSON request and response bodies.
+- Non-JSON request bodies.
 
 ## Example
 
@@ -320,6 +321,53 @@ for item, err := range client.ListThingsPaginator(ctx) {
 - `NextField` (optional): The Go struct field path for the next-page URL. Supports dot-separated paths for nested fields (e.g. `"Next"`, `"Meta.Next"`, `"Pagination.NextURL"`). When set, enables body-based pagination.
 
 When both a `Link` header and a body next-page field are available, the `Link` header takes precedence. If `Pagination` is nil (the default), only array responses with `Link` headers are treated as paginated, preserving backward compatibility.
+
+### Server-Sent Events (SSE)
+
+SSE endpoints registered with Huma's [`sse.Register()`](https://huma.rocks/features/sse/) are automatically detected and generate two methods per operation:
+
+- A **base method** (e.g. `WatchChat`) that returns `(*http.Response, error)` with the body left open for manual consumption
+- A **stream method** (e.g. `WatchChatStream`) that returns `iter.Seq2[SSEEvent, error]` for ergonomic iteration
+
+Event data is pre-unmarshaled based on the event type, so you can type-switch directly:
+
+```go
+for event, err := range client.WatchChatStream(ctx) {
+    if err != nil {
+        log.Fatal(err)
+    }
+    switch data := event.Data.(type) {
+    case exampleapiclient.ChatMessage:
+        fmt.Printf("%s: %s\n", data.User, data.Message)
+    case exampleapiclient.UserJoinedEvent:
+        fmt.Printf("%s joined the chat\n", data.User)
+    default:
+        fmt.Println("Unknown event:", event.Type, event.Data)
+    }
+}
+```
+
+The `SSEEvent` struct provides access to all SSE fields:
+
+```go
+type SSEEvent struct {
+    Type  string // Event type (e.g. "userJoin"). Empty for default "message" events.
+    ID    string // Optional event ID (string per SSE spec)
+    Retry int    // Optional retry time in milliseconds
+    Data  any    // Pre-unmarshaled data; type-assert based on event type
+}
+```
+
+Context cancellation stops the stream iterator. For low-level control (e.g. using channels, `select{}`, or custom parsing), use the base method:
+
+```go
+resp, err := client.WatchChat(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+defer resp.Body.Close()
+// Read resp.Body manually...
+```
 
 ### Following Links
 

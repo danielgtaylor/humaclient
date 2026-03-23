@@ -7,6 +7,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"github.com/danielgtaylor/huma/v2/sse"
 	"github.com/danielgtaylor/humaclient"
 )
 
@@ -72,6 +73,31 @@ func main() {
 				Total: 2,
 			},
 		}, nil
+	})
+
+	// SSE endpoint for real-time event streaming
+	type ChatMessage struct {
+		User    string `json:"user" doc:"The user who sent the message"`
+		Message string `json:"message" doc:"The chat message content"`
+	}
+
+	type UserJoinedEvent struct {
+		User string `json:"user" doc:"The user who joined"`
+	}
+
+	sse.Register(api, huma.Operation{
+		OperationID: "watch-chat",
+		Method:      http.MethodGet,
+		Path:        "/chat/events",
+		Summary:     "Watch chat events",
+		Description: "Stream real-time chat events via Server-Sent Events",
+	}, map[string]any{
+		"message":  ChatMessage{},
+		"userJoin": UserJoinedEvent{},
+	}, func(ctx context.Context, input *struct{}, send sse.Sender) {
+		send.Data(UserJoinedEvent{User: "alice"})
+		send(sse.Message{Data: ChatMessage{User: "alice", Message: "Hello!"}})
+		send(sse.Message{ID: 1, Data: ChatMessage{User: "bob", Message: "Hi there!"}})
 	})
 
 	// Register for client generation with object-wrapped pagination

@@ -55,6 +55,7 @@ type ClientTemplateData struct {
 	HasRequestBodies    bool
 	HasMergePatch       bool // Whether any operation supports both merge-patch+json and json-patch+json (autopatch)
 	HasJSONPatchOp      bool // Whether JSONPatchOp already exists as a schema struct
+	HasSSE              bool // Whether any operation uses Server-Sent Events
 }
 
 // SchemaData represents an OpenAPI schema for code generation
@@ -94,11 +95,19 @@ type OperationData struct {
 	OptionsFields     []OptionField
 	IsPaginated       bool
 	ItemType          string
-	IsMergePatch      bool   // Whether this operation has both merge-patch and json-patch media types (autopatch detection)
-	ItemsField        string // Go struct field name for items array in wrapped responses (e.g. "Items")
-	NextField         string // Go struct field path for next-page URL (e.g. "Next" or "Meta.Next")
-	NextFieldNilCheck string // Nil-check expression for nullable intermediate fields in NextField path
-	ResponseType      string // Wrapper struct type name for object-wrapped paginated responses
+	IsMergePatch      bool               // Whether this operation has both merge-patch and json-patch media types (autopatch detection)
+	ItemsField        string             // Go struct field name for items array in wrapped responses (e.g. "Items")
+	NextField         string             // Go struct field path for next-page URL (e.g. "Next" or "Meta.Next")
+	NextFieldNilCheck string             // Nil-check expression for nullable intermediate fields in NextField path
+	ResponseType      string             // Wrapper struct type name for object-wrapped paginated responses
+	IsSSE             bool               // Whether this operation returns text/event-stream (SSE)
+	SSEEventTypes     []SSEEventTypeData // Event types for SSE operations
+}
+
+// SSEEventTypeData represents a single event type in an SSE operation
+type SSEEventTypeData struct {
+	EventName string // SSE event name (e.g. "userCreate", "message")
+	GoType    string // Go type name for the event data (e.g. "UserCreateEvent")
 }
 
 // ParamData represents a parameter
@@ -249,10 +258,8 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 		"\"strings\"",
 	}
 
-	// Add iter import if we have paginated operations
-	if hasPaginatedOperations(openapi, opts.Pagination) {
-		data.Imports = append(data.Imports, "\"iter\"")
-	}
+	// iter import is added later if needed (pagination or SSE)
+	needsIter := hasPaginatedOperations(openapi, opts.Pagination)
 
 	sort.Strings(data.Imports)
 
@@ -284,6 +291,24 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 			data.HasJSONPatchOp = true
 			break
 		}
+	}
+
+	// Check if any operations use SSE
+	for _, op := range data.Operations {
+		if op.IsSSE {
+			data.HasSSE = true
+			break
+		}
+	}
+
+	// Add SSE-specific imports
+	if data.HasSSE {
+		data.Imports = append(data.Imports, "\"bufio\"", "\"strconv\"")
+		needsIter = true
+	}
+
+	if needsIter {
+		data.Imports = append(data.Imports, "\"iter\"")
 	}
 
 	// Add standard library imports that were collected as external imports
@@ -735,6 +760,9 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 	// Handle return type
 	opData.ReturnType, opData.ZeroValue, opData.HasResponseBody = generateReturnType(operation, openapi, allowedPackages, externalImports, currentPkgPath)
 
+	// Check for SSE (Server-Sent Events) support
+	handleSSE(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath)
+
 	// Check for pagination support
 	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath, pagination)
 
@@ -768,6 +796,80 @@ func handleRequestBody(opData *OperationData, operation *huma.Operation, openapi
 		opData.IsMergePatch = true
 		opData.HasRequestBody = true
 		opData.RequestBodyType = "Patchable"
+	}
+}
+
+// handleSSE detects Server-Sent Events operations and extracts event type information
+func handleSSE(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) {
+	// Sort status codes for deterministic iteration
+	statusCodes := make([]string, 0, len(operation.Responses))
+	for code := range operation.Responses {
+		statusCodes = append(statusCodes, code)
+	}
+	sort.Strings(statusCodes)
+
+	for _, statusCode := range statusCodes {
+		response := operation.Responses[statusCode]
+		if statusCode[0] != '2' || response.Content == nil {
+			continue
+		}
+		sseContent := response.Content["text/event-stream"]
+		if sseContent == nil || sseContent.Schema == nil {
+			continue
+		}
+
+		opData.IsSSE = true
+
+		// The SSE schema is type:array with items containing oneOf in extensions
+		items := sseContent.Schema.Items
+		if items == nil || items.Extensions == nil {
+			break
+		}
+
+		oneOfRaw, ok := items.Extensions["oneOf"]
+		if !ok {
+			break
+		}
+
+		// oneOf is a []*huma.Schema from Huma's SSE registration
+		oneOfSchemas, ok := oneOfRaw.([]*huma.Schema)
+		if !ok {
+			break
+		}
+
+		for _, eventSchema := range oneOfSchemas {
+			if eventSchema.Properties == nil {
+				continue
+			}
+
+			// Extract event name from properties.event.Extensions["const"]
+			eventName := "message"
+			if eventProp := eventSchema.Properties["event"]; eventProp != nil {
+				if constVal, ok := eventProp.Extensions["const"]; ok {
+					if name, ok := constVal.(string); ok && name != "" {
+						eventName = name
+					}
+				}
+			}
+
+			// Extract data type from properties.data
+			goType := "any"
+			if dataProp := eventSchema.Properties["data"]; dataProp != nil {
+				goType = schemaToGoType(dataProp, openapi, false, allowedPackages, externalImports, currentPkgPath)
+			}
+
+			opData.SSEEventTypes = append(opData.SSEEventTypes, SSEEventTypeData{
+				EventName: eventName,
+				GoType:    goType,
+			})
+		}
+
+		// Sort event types by name for stable output
+		sort.Slice(opData.SSEEventTypes, func(i, j int) bool {
+			return opData.SSEEventTypes[i].EventName < opData.SSEEventTypes[j].EventName
+		})
+
+		break
 	}
 }
 
@@ -1592,12 +1694,112 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 {{end}}
 {{- end}}
 
+{{- if .HasSSE}}
+// SSEEvent represents a single Server-Sent Event.
+type SSEEvent struct {
+	// Type is the event type name (e.g. "userCreate"). Empty string means "message" (default).
+	Type  string
+	// ID is the optional event ID. Per the SSE spec, this is a string (not necessarily numeric).
+	ID    string
+	// Retry is the optional retry time in milliseconds.
+	Retry int
+	// Data is the pre-unmarshaled event data. Type-assert to the appropriate struct
+	// based on event type. Unknown event types will have json.RawMessage data.
+	Data  any
+}
+
+// parseSSEStream reads an SSE stream from an io.Reader and yields events.
+func parseSSEStream(r io.Reader, unmarshal func(string, []byte) (any, error)) iter.Seq2[SSEEvent, error] {
+	return func(yield func(SSEEvent, error) bool) {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		var event SSEEvent
+		var dataBuf []byte
+		hasData := false
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Per SSE spec, lines may end with CR, LF, or CRLF. bufio.Scanner
+			// splits on LF, so trim any trailing CR from CRLF endings.
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+
+			if line == "" {
+				// Blank line: emit event if we have data
+				if hasData {
+					data, err := unmarshal(event.Type, dataBuf)
+					if err != nil {
+						if !yield(SSEEvent{}, err) {
+							return
+						}
+					} else {
+						event.Data = data
+						if !yield(event, nil) {
+							return
+						}
+					}
+				}
+				// Reset for next event
+				event = SSEEvent{}
+				dataBuf = dataBuf[:0]
+				hasData = false
+				continue
+			}
+
+			if line[0] == ':' {
+				// Comment, ignore
+				continue
+			}
+
+			field, value, _ := strings.Cut(line, ":")
+			value = strings.TrimPrefix(value, " ")
+
+			switch field {
+			case "data":
+				if hasData {
+					dataBuf = append(dataBuf, '\n')
+				}
+				dataBuf = append(dataBuf, value...)
+				hasData = true
+			case "event":
+				event.Type = value
+			case "id":
+				event.ID = value
+			case "retry":
+				if v, err := strconv.Atoi(value); err == nil {
+					event.Retry = v
+				}
+			}
+		}
+
+		// Yield any remaining event at EOF
+		if hasData {
+			data, err := unmarshal(event.Type, dataBuf)
+			if err != nil {
+				yield(SSEEvent{}, err)
+			} else {
+				event.Data = data
+				yield(event, nil)
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			yield(SSEEvent{}, err)
+		}
+	}
+}
+{{- end}}
+
 // {{.ClientInterfaceName}} defines the interface for the API client
 type {{.ClientInterfaceName}} interface {
 {{- range .Operations}}
 	{{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}}
 {{- if .IsPaginated}}
 	{{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error]
+{{- end}}
+{{- if .IsSSE}}
+	{{.MethodName}}Stream(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[SSEEvent, error]
 {{- end}}
 {{- end}}
 	Follow(ctx context.Context, link string, result any, opts ...Option) (*http.Response, error)
@@ -1701,6 +1903,9 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 		req.Header.Set("Content-Type", "application/json")
 	}
 {{- end}}
+{{- if .IsSSE}}
+	req.Header.Set("Accept", "text/event-stream")
+{{- end}}
 	reqOpts.applyHeaders(req)
 
 	// Execute request
@@ -1712,10 +1917,15 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 		return nil, fmt.Errorf("request failed: %w", err)
 {{- end}}
 	}
+{{- if .HasResponseBody}}
 	defer resp.Body.Close()
+{{- end}}
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
+{{- if not .HasResponseBody}}
+		defer resp.Body.Close()
+{{- end}}
 		body, _ := io.ReadAll(resp.Body)
 {{- if .HasResponseBody}}
 		return resp, {{.ZeroValue}}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
@@ -1884,6 +2094,46 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{r
 
 			result = nextResult
 {{- end}}
+		}
+	}
+}
+{{- end}}
+{{- end}}
+
+{{/* Generate SSE stream method implementations */}}
+{{- range .Operations}}
+{{- if .IsSSE}}
+// unmarshal{{.MethodName}}Data unmarshals SSE event data based on event type.
+func unmarshal{{.MethodName}}Data(eventType string, raw []byte) (any, error) {
+	switch eventType {
+{{- range .SSEEventTypes}}
+{{- if eq .EventName "message"}}
+	case "message", "":
+{{- else}}
+	case "{{.EventName}}":
+{{- end}}
+		var d {{.GoType}}
+		return d, json.Unmarshal(raw, &d)
+{{- end}}
+	default:
+		return json.RawMessage(raw), nil
+	}
+}
+
+// {{.MethodName}}Stream returns an iterator that yields parsed SSE events from {{.MethodName}}
+func (c *{{$.ClientStructName}}) {{.MethodName}}Stream(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[SSEEvent, error] {
+	return func(yield func(SSEEvent, error) bool) {
+		resp, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
+		if err != nil {
+			yield(SSEEvent{}, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		for event, err := range parseSSEStream(resp.Body, unmarshal{{.MethodName}}Data) {
+			if !yield(event, err) {
+				return
+			}
 		}
 	}
 }

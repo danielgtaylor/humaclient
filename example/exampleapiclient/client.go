@@ -3,6 +3,7 @@
 package exampleapiclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,8 +12,15 @@ import (
 	"iter"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
+
+// ChatMessage represents the ChatMessage schema
+type ChatMessage struct {
+	Message string `json:"message" doc:"The chat message content"`
+	User    string `json:"user" doc:"The user who sent the message"`
+}
 
 // ErrorDetail represents the ErrorDetail schema
 type ErrorDetail struct {
@@ -45,6 +53,11 @@ type Thing struct {
 	Name            string `json:"name" doc:"The name of the thing" minLength:"3" example:"My Thing"`
 	ReadOnlyID      string `json:"readOnlyId" doc:"Read-only identifier" readOnly:"true"`
 	WriteOnlyToken  string `json:"writeOnlyToken" doc:"Write-only authentication token" writeOnly:"true"`
+}
+
+// UserJoinedEvent represents the UserJoinedEvent schema
+type UserJoinedEvent struct {
+	User string `json:"user" doc:"The user who joined"`
 }
 
 // Option is a functional option for customizing requests
@@ -134,8 +147,105 @@ func (o ListThingsOptions) Apply(opts *RequestOptions) {
 	}
 }
 
+// SSEEvent represents a single Server-Sent Event.
+type SSEEvent struct {
+	// Type is the event type name (e.g. "userCreate"). Empty string means "message" (default).
+	Type string
+	// ID is the optional event ID. Per the SSE spec, this is a string (not necessarily numeric).
+	ID string
+	// Retry is the optional retry time in milliseconds.
+	Retry int
+	// Data is the pre-unmarshaled event data. Type-assert to the appropriate struct
+	// based on event type. Unknown event types will have json.RawMessage data.
+	Data any
+}
+
+// parseSSEStream reads an SSE stream from an io.Reader and yields events.
+func parseSSEStream(r io.Reader, unmarshal func(string, []byte) (any, error)) iter.Seq2[SSEEvent, error] {
+	return func(yield func(SSEEvent, error) bool) {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		var event SSEEvent
+		var dataBuf []byte
+		hasData := false
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Per SSE spec, lines may end with CR, LF, or CRLF. bufio.Scanner
+			// splits on LF, so trim any trailing CR from CRLF endings.
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+
+			if line == "" {
+				// Blank line: emit event if we have data
+				if hasData {
+					data, err := unmarshal(event.Type, dataBuf)
+					if err != nil {
+						if !yield(SSEEvent{}, err) {
+							return
+						}
+					} else {
+						event.Data = data
+						if !yield(event, nil) {
+							return
+						}
+					}
+				}
+				// Reset for next event
+				event = SSEEvent{}
+				dataBuf = dataBuf[:0]
+				hasData = false
+				continue
+			}
+
+			if line[0] == ':' {
+				// Comment, ignore
+				continue
+			}
+
+			field, value, _ := strings.Cut(line, ":")
+			value = strings.TrimPrefix(value, " ")
+
+			switch field {
+			case "data":
+				if hasData {
+					dataBuf = append(dataBuf, '\n')
+				}
+				dataBuf = append(dataBuf, value...)
+				hasData = true
+			case "event":
+				event.Type = value
+			case "id":
+				event.ID = value
+			case "retry":
+				if v, err := strconv.Atoi(value); err == nil {
+					event.Retry = v
+				}
+			}
+		}
+
+		// Yield any remaining event at EOF
+		if hasData {
+			data, err := unmarshal(event.Type, dataBuf)
+			if err != nil {
+				yield(SSEEvent{}, err)
+			} else {
+				event.Data = data
+				yield(event, nil)
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			yield(SSEEvent{}, err)
+		}
+	}
+}
+
 // ExampleAPIClient defines the interface for the API client
 type ExampleAPIClient interface {
+	WatchChat(ctx context.Context, opts ...Option) (*http.Response, error)
+	WatchChatStream(ctx context.Context, opts ...Option) iter.Seq2[SSEEvent, error]
 	ListThings(ctx context.Context, opts ...Option) (*http.Response, ListThingsResponseBody, error)
 	ListThingsPaginator(ctx context.Context, opts ...Option) iter.Seq2[*Thing, error]
 	GetThingsByID(ctx context.Context, id string, opts ...Option) (*http.Response, Thing, error)
@@ -162,6 +272,53 @@ func NewWithClient(baseURL string, client *http.Client) ExampleAPIClient {
 		baseURL:    baseURL,
 		httpClient: client,
 	}
+}
+
+// WatchChat calls the GET /chat/events endpoint
+func (c *ExampleAPIClientImpl) WatchChat(ctx context.Context, opts ...Option) (*http.Response, error) {
+	// Apply options
+	reqOpts := &RequestOptions{}
+	for _, opt := range opts {
+		opt(reqOpts)
+	}
+
+	// Build URL with path parameters
+	pathTemplate := "/chat/events"
+
+	u, err := url.Parse(c.baseURL + pathTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	// Apply query parameters
+	reqOpts.applyQueryParams(u)
+
+	// Prepare request body
+	var reqBody io.Reader
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set content type and apply custom headers
+	req.Header.Set("Accept", "text/event-stream")
+	reqOpts.applyHeaders(req)
+
+	// Execute request
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	// Handle error responses
+	if resp.StatusCode >= 400 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+	return resp, nil
 }
 
 // ListThings calls the GET /things endpoint
@@ -391,6 +548,38 @@ func (c *ExampleAPIClientImpl) ListThingsPaginator(ctx context.Context, opts ...
 			}
 
 			result = nextResult
+		}
+	}
+}
+
+// unmarshalWatchChatData unmarshals SSE event data based on event type.
+func unmarshalWatchChatData(eventType string, raw []byte) (any, error) {
+	switch eventType {
+	case "message", "":
+		var d ChatMessage
+		return d, json.Unmarshal(raw, &d)
+	case "userJoin":
+		var d UserJoinedEvent
+		return d, json.Unmarshal(raw, &d)
+	default:
+		return json.RawMessage(raw), nil
+	}
+}
+
+// WatchChatStream returns an iterator that yields parsed SSE events from WatchChat
+func (c *ExampleAPIClientImpl) WatchChatStream(ctx context.Context, opts ...Option) iter.Seq2[SSEEvent, error] {
+	return func(yield func(SSEEvent, error) bool) {
+		resp, err := c.WatchChat(ctx, opts...)
+		if err != nil {
+			yield(SSEEvent{}, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		for event, err := range parseSSEStream(resp.Body, unmarshalWatchChatData) {
+			if !yield(event, err) {
+				return
+			}
 		}
 	}
 }
