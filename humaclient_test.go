@@ -1998,7 +1998,9 @@ func TestStringFormatToGoTypeConversion(t *testing.T) {
 	api := humago.New(mux, huma.DefaultConfig("Format Test API", "1.0.0"))
 
 	huma.Get(api, "/events/{id}", func(ctx context.Context, input *struct {
-		ID string `path:"id"`
+		ID       string `path:"id"`
+		RealIPv4 string `format:"ipv4" header:"X-Real-Ipv4"`
+		RealIPv6 string `format:"ipv6" header:"X-Real-Ipv6"`
 	}) (*struct{ Body EventRecord }, error) {
 		return &struct{ Body EventRecord }{
 			Body: EventRecord{
@@ -2031,6 +2033,10 @@ func TestStringFormatToGoTypeConversion(t *testing.T) {
 	}
 
 	clientCode := string(content)
+
+	if err := exec.Command("go", "build", clientFile).Run(); err != nil {
+		t.Fatalf("Failed to build generated client: %v", err)
+	}
 
 	t.Run("TimeFormatsUseTimeType", func(t *testing.T) {
 		// Check that date-time format uses time.Time
