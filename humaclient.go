@@ -1664,6 +1664,8 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 	if o.{{.Name}} {
 {{- else if eq .Type "time.Time"}}
 	if !o.{{.Name}}.IsZero() {
+{{- else if eq .Type "net.IP"}}
+	if len(o.{{.Name}}) != 0 {
 {{- else if hasPrefix .Type "*"}}
 	if o.{{.Name}} != nil {
 {{- else}}
