@@ -177,12 +177,16 @@ Read on for optional request bodies.
 
 ### Required Query Parameters
 
-Query parameters marked `required:"true"` in the API definition are generated as mandatory positional arguments on the client method, so missing them is a compile-time error rather than a silent runtime failure. They are not included in the operation's options struct.
+Query parameters marked `required:"true"` in the API definition are generated as mandatory positional arguments on the client method, so missing them is a compile-time error rather than a silent runtime failure.
 
 ```go
 // Required query params come after path params and before any optional body.
 client.ListThings(ctx, "active", 50)
 ```
+
+Required values take precedence over any `WithQuery(...)` override targeting the same key, so the typed contract on the method signature stays authoritative.
+
+Required query parameters are not included in the per-operation options struct. If you were previously passing one of these parameters through `WithOptions(FooOptions{...})`, you will need to lift it to a positional argument when regenerating the client.
 
 ### Optional Parameters
 

@@ -1859,7 +1859,11 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- end}}
 	}
 
+	// Apply custom query parameters first so that required query parameters
+	// below take precedence over any caller-supplied overrides.
+	reqOpts.applyQueryParams(u)
 {{- if .RequiredQueryParams}}
+
 	// Apply required query parameters
 	requiredQueryValues := u.Query()
 {{- range .RequiredQueryParams}}
@@ -1871,9 +1875,6 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- end}}
 	u.RawQuery = requiredQueryValues.Encode()
 {{- end}}
-
-	// Apply query parameters
-	reqOpts.applyQueryParams(u)
 
 	// Prepare request body
 	var reqBody io.Reader

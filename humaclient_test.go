@@ -5240,3 +5240,89 @@ func main() {
 		t.Errorf("Expected optional cursor=abc to still flow through, got: %s", requestURL)
 	}
 }
+
+func TestRequiredQueryParamsOverridePrecedence(t *testing.T) {
+	// Required positional args must win over caller-supplied overrides via
+	// WithQuery, so the typed API contract stays authoritative.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Required Query Precedence API", "1.0.0"))
+
+	huma.Get(api, "/search", func(ctx context.Context, input *struct {
+		Query string `query:"q" required:"true"`
+	}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_required_query_precedence_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]string{"q=" + r.URL.Query().Get("q")})
+	}))
+	defer server.Close()
+
+	if err := os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644); err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	prog := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/requiredqueryprecedenceapiclient"
+)
+
+func main() {
+	client := requiredqueryprecedenceapiclient.NewWithClient("%s", &http.Client{Timeout: 5 * time.Second})
+
+	resp, _, err := client.ListSearch(context.Background(), "authoritative",
+		requiredqueryprecedenceapiclient.WithQuery("q", "override-attempt"))
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	json.NewEncoder(os.Stdout).Encode(map[string]any{"url": resp.Request.URL.String()})
+}
+`, server.URL)
+
+	if err := os.WriteFile("main.go", []byte(prog), 0644); err != nil {
+		t.Fatalf("Failed to write test program: %v", err)
+	}
+
+	output, err := runGoProgram("main.go")
+	if err != nil {
+		t.Fatalf("Test program failed: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+	}
+
+	requestURL := result["url"].(string)
+	if !strings.Contains(requestURL, "q=authoritative") {
+		t.Errorf("Expected required positional arg to win over WithQuery override, got: %s", requestURL)
+	}
+	if strings.Contains(requestURL, "q=override-attempt") {
+		t.Errorf("WithQuery should not have overridden the required positional arg, got: %s", requestURL)
+	}
+}
