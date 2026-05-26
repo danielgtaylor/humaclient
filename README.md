@@ -175,6 +175,15 @@ client.PutThingByID(ctx, "abc123", Thing{
 
 Read on for optional request bodies.
 
+### Required Query Parameters
+
+Query parameters marked `required:"true"` in the API definition are generated as mandatory positional arguments on the client method, so missing them is a compile-time error rather than a silent runtime failure. They are not included in the operation's options struct.
+
+```go
+// Required query params come after path params and before any optional body.
+client.ListThings(ctx, "active", 50)
+```
+
 ### Optional Parameters
 
 You can set optional defined parameters as well as custom query params or headers when making outgoing requests.

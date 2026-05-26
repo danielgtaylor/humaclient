@@ -77,31 +77,32 @@ type FieldData struct {
 
 // OperationData represents an API operation for code generation
 type OperationData struct {
-	MethodName        string
-	HTTPMethod        string
-	Path              string
-	PathParams        []ParamData
-	HasRequestBody    bool
-	RequestBodyType   string
-	HasOptionalBody   bool
-	HasResponseBody   bool
-	ReturnType        string
-	ZeroValue         string
-	HasQueryParams    bool
-	HasHeaderParams   bool
-	QueryParams       []ParamData
-	HeaderParams      []ParamData
-	OptionsStructName string
-	OptionsFields     []OptionField
-	IsPaginated       bool
-	ItemType          string
-	IsMergePatch      bool               // Whether this operation has both merge-patch and json-patch media types (autopatch detection)
-	ItemsField        string             // Go struct field name for items array in wrapped responses (e.g. "Items")
-	NextField         string             // Go struct field path for next-page URL (e.g. "Next" or "Meta.Next")
-	NextFieldNilCheck string             // Nil-check expression for nullable intermediate fields in NextField path
-	ResponseType      string             // Wrapper struct type name for object-wrapped paginated responses
-	IsSSE             bool               // Whether this operation returns text/event-stream (SSE)
-	SSEEventTypes     []SSEEventTypeData // Event types for SSE operations
+	MethodName          string
+	HTTPMethod          string
+	Path                string
+	PathParams          []ParamData
+	HasRequestBody      bool
+	RequestBodyType     string
+	HasOptionalBody     bool
+	HasResponseBody     bool
+	ReturnType          string
+	ZeroValue           string
+	HasQueryParams      bool
+	HasHeaderParams     bool
+	QueryParams         []ParamData
+	RequiredQueryParams []ParamData
+	HeaderParams        []ParamData
+	OptionsStructName   string
+	OptionsFields       []OptionField
+	IsPaginated         bool
+	ItemType            string
+	IsMergePatch        bool               // Whether this operation has both merge-patch and json-patch media types (autopatch detection)
+	ItemsField          string             // Go struct field name for items array in wrapped responses (e.g. "Items")
+	NextField           string             // Go struct field path for next-page URL (e.g. "Next" or "Meta.Next")
+	NextFieldNilCheck   string             // Nil-check expression for nullable intermediate fields in NextField path
+	ResponseType        string             // Wrapper struct type name for object-wrapped paginated responses
+	IsSSE               bool               // Whether this operation returns text/event-stream (SSE)
+	SSEEventTypes       []SSEEventTypeData // Event types for SSE operations
 }
 
 // SSEEventTypeData represents a single event type in an SSE operation
@@ -959,7 +960,11 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, allO
 		case "query":
 			opData.HasQueryParams = true
 			opData.QueryParams = append(opData.QueryParams, paramData)
-			addToOptionsIfNotExists(allOptions, &opData.OptionsFields, paramData, "query")
+			if paramData.Required {
+				opData.RequiredQueryParams = append(opData.RequiredQueryParams, paramData)
+			} else {
+				addToOptionsIfNotExists(allOptions, &opData.OptionsFields, paramData, "query")
+			}
 
 		case "header":
 			opData.HasHeaderParams = true
@@ -1796,12 +1801,12 @@ func parseSSEStream(r io.Reader, unmarshal func(string, []byte) (any, error)) it
 // {{.ClientInterfaceName}} defines the interface for the API client
 type {{.ClientInterfaceName}} interface {
 {{- range .Operations}}
-	{{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}}
+	{{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}}
 {{- if .IsPaginated}}
-	{{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error]
+	{{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error]
 {{- end}}
 {{- if .IsSSE}}
-	{{.MethodName}}Stream(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[SSEEvent, error]
+	{{.MethodName}}Stream(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[SSEEvent, error]
 {{- end}}
 {{- end}}
 	Follow(ctx context.Context, link string, result any, opts ...Option) (*http.Response, error)
@@ -1832,7 +1837,7 @@ func NewWithClient(baseURL string, client *http.Client) {{.ClientInterfaceName}}
 {{/* Generate method implementations */}}
 {{- range .Operations}}
 // {{.MethodName}} calls the {{.HTTPMethod}} {{.Path}} endpoint
-func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}} {
+func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}} {
 	// Apply options
 	reqOpts := &RequestOptions{}
 	for _, opt := range opts {
@@ -1853,6 +1858,19 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 		return nil, fmt.Errorf("invalid URL: %w", err)
 {{- end}}
 	}
+
+{{- if .RequiredQueryParams}}
+	// Apply required query parameters
+	requiredQueryValues := u.Query()
+{{- range .RequiredQueryParams}}
+{{- if eq .Type "string"}}
+	requiredQueryValues.Set("{{.Name}}", {{.GoNameLowerCamel}})
+{{- else}}
+	requiredQueryValues.Set("{{.Name}}", fmt.Sprintf("%v", {{.GoNameLowerCamel}}))
+{{- end}}
+{{- end}}
+	u.RawQuery = requiredQueryValues.Encode()
+{{- end}}
 
 	// Apply query parameters
 	reqOpts.applyQueryParams(u)
@@ -2019,13 +2037,13 @@ func (c *{{.ClientStructName}}) Follow(ctx context.Context, link string, result 
 {{- range .Operations}}
 {{- if .IsPaginated}}
 // {{.MethodName}}Paginator returns an iterator that fetches all pages of {{.MethodName}} results
-func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error] {
+func (c *{{$.ClientStructName}}) {{.MethodName}}Paginator(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[{{.ItemType}}, error] {
 	return func(yield func({{.ItemType}}, error) bool) {
 		// Start with the first page
 {{- if .ResponseType}}
-		resp, result, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
+		resp, result, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
 {{- else}}
-		resp, items, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
+		resp, items, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
 {{- end}}
 		if err != nil {
 			var zero {{.ItemType}}
@@ -2123,9 +2141,9 @@ func unmarshal{{.MethodName}}Data(eventType string, raw []byte) (any, error) {
 }
 
 // {{.MethodName}}Stream returns an iterator that yields parsed SSE events from {{.MethodName}}
-func (c *{{$.ClientStructName}}) {{.MethodName}}Stream(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[SSEEvent, error] {
+func (c *{{$.ClientStructName}}) {{.MethodName}}Stream(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}, opts ...Option) iter.Seq2[SSEEvent, error] {
 	return func(yield func(SSEEvent, error) bool) {
-		resp, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
+		resp, err := c.{{.MethodName}}(ctx{{range .PathParams}}, {{.GoNameLowerCamel}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}}{{end}}, opts...)
 		if err != nil {
 			yield(SSEEvent{}, err)
 			return
