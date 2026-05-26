@@ -960,7 +960,11 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, allO
 		case "query":
 			opData.HasQueryParams = true
 			opData.QueryParams = append(opData.QueryParams, paramData)
-			if paramData.Required {
+			// A documented default means the server fills the value in when the
+			// client omits it, so the parameter is effectively optional on the
+			// wire regardless of what the required flag claims.
+			hasDefault := param.Schema != nil && param.Schema.Default != nil
+			if paramData.Required && !hasDefault {
 				opData.RequiredQueryParams = append(opData.RequiredQueryParams, paramData)
 			} else {
 				addToOptionsIfNotExists(allOptions, &opData.OptionsFields, paramData, "query")

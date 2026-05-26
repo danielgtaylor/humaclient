@@ -5241,6 +5241,61 @@ func main() {
 	}
 }
 
+func TestRequiredQueryParamsWithDefaultDemoted(t *testing.T) {
+	// A query param marked required:"true" but also carrying a default value is
+	// effectively optional on the wire (the server fills it in), so the
+	// generated client should keep it in the options struct rather than
+	// promoting it to a required positional argument.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Required With Default API", "1.0.0"))
+
+	huma.Get(api, "/search", func(ctx context.Context, input *struct {
+		Query string `query:"q" required:"true"`
+		Limit int    `query:"limit" required:"true" default:"10"`
+	}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_required_with_default_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("requiredwithdefaultapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+	clientCode := string(content)
+
+	// q has no default → required positional arg.
+	// limit has a default → demoted to the options struct.
+	if !strings.Contains(clientCode, "ListSearch(ctx context.Context, q string, opts ...Option)") {
+		t.Errorf("Expected ListSearch to keep q as a required arg and demote limit, got:\n%s", clientCode)
+	}
+	if strings.Contains(clientCode, "limit int64, opts") {
+		t.Errorf("Did not expect limit to remain a required positional arg when a default is set")
+	}
+
+	idx := strings.Index(clientCode, "type ListSearchOptions struct")
+	if idx < 0 {
+		t.Fatalf("Expected ListSearchOptions struct for demoted limit field")
+	}
+	end := strings.Index(clientCode[idx:], "}")
+	optsBlock := clientCode[idx : idx+end]
+	if !strings.Contains(optsBlock, "Limit ") {
+		t.Errorf("Expected demoted Limit field in options struct, got:\n%s", optsBlock)
+	}
+}
+
 func TestRequiredQueryParamsOverridePrecedence(t *testing.T) {
 	// Required positional args must win over caller-supplied overrides via
 	// WithQuery, so the typed API contract stays authoritative.
