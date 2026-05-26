@@ -5041,3 +5041,343 @@ func TestNonSSEClientUnchanged(t *testing.T) {
 		t.Error("Non-SSE client should not import strconv")
 	}
 }
+
+func TestRequiredQueryParams(t *testing.T) {
+	// API with a mix of required and optional query parameters.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Required Query API", "1.0.0"))
+
+	huma.Get(api, "/search", func(ctx context.Context, input *struct {
+		Query  string `query:"q" required:"true" doc:"Search query"`
+		Limit  int    `query:"limit" required:"true" doc:"Page size"`
+		Cursor string `query:"cursor" doc:"Pagination cursor"`
+	}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a", "b"}}, nil
+	})
+
+	huma.Get(api, "/items/{id}", func(ctx context.Context, input *struct {
+		ID     string `path:"id"`
+		Format string `query:"format" required:"true" doc:"Response format"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: input.ID}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_required_query_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	clientFile := "requiredqueryapiclient/client.go"
+	content, err := os.ReadFile(clientFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+	clientCode := string(content)
+
+	t.Run("RequiredParamsInSignature", func(t *testing.T) {
+		// /search returns a list, so Huma names the op "list-search".
+		if !strings.Contains(clientCode, "ListSearch(ctx context.Context, q string, limit int64, opts ...Option)") {
+			t.Errorf("Expected ListSearch signature with required q and limit args, got:\n%s", clientCode)
+		}
+		// /items/{id} keeps the path param first, then the required query param.
+		if !strings.Contains(clientCode, "GetItemsByID(ctx context.Context, id string, format string, opts ...Option)") {
+			t.Errorf("Expected GetItemsByID signature with id path and format query args, got:\n%s", clientCode)
+		}
+	})
+
+	t.Run("RequiredParamsExcludedFromOptions", func(t *testing.T) {
+		// The options struct for /search should only carry the optional cursor.
+		idx := strings.Index(clientCode, "type ListSearchOptions struct")
+		if idx < 0 {
+			t.Fatalf("Expected ListSearchOptions struct to exist for optional cursor:\n%s", clientCode)
+		}
+		end := strings.Index(clientCode[idx:], "}")
+		if end <= 0 {
+			t.Fatalf("Malformed ListSearchOptions struct in generated code")
+		}
+		optsBlock := clientCode[idx : idx+end]
+		if !strings.Contains(optsBlock, "Cursor string") {
+			t.Errorf("Expected Cursor field in ListSearchOptions, got:\n%s", optsBlock)
+		}
+		if strings.Contains(optsBlock, "Q ") || strings.Contains(optsBlock, "Limit ") {
+			t.Errorf("Required params should not appear in ListSearchOptions, got:\n%s", optsBlock)
+		}
+		// /items/{id} only has one required query param and no optional ones, so
+		// no options struct should be generated for it.
+		if strings.Contains(clientCode, "type GetItemsByIDOptions struct") {
+			t.Errorf("Did not expect GetItemsByIDOptions struct when only required params exist")
+		}
+	})
+
+	t.Run("RequiredParamsAppliedToURL", func(t *testing.T) {
+		if !strings.Contains(clientCode, `requiredQueryValues.Set("q", q)`) {
+			t.Errorf("Expected string required param to be set directly on URL query")
+		}
+		if !strings.Contains(clientCode, `requiredQueryValues.Set("limit", fmt.Sprintf("%v", limit))`) {
+			t.Errorf("Expected non-string required param to be formatted with fmt.Sprintf")
+		}
+		if !strings.Contains(clientCode, `requiredQueryValues.Set("format", format)`) {
+			t.Errorf("Expected format required param to be set on URL query")
+		}
+	})
+
+	t.Run("GeneratedCodeCompiles", func(t *testing.T) {
+		fset := token.NewFileSet()
+		if _, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments); err != nil {
+			t.Fatalf("Generated client has syntax errors: %v", err)
+		}
+	})
+}
+
+func TestRequiredQueryParamsBehavior(t *testing.T) {
+	// Generate a client with required query params and exercise it against a
+	// real test server to verify required values land on the wire.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Required Query Behavior API", "1.0.0"))
+
+	huma.Get(api, "/search", func(ctx context.Context, input *struct {
+		Query  string `query:"q" required:"true"`
+		Limit  int    `query:"limit" required:"true"`
+		Cursor string `query:"cursor"`
+	}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_required_query_behavior_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Echo back the query values that hit the server so the test can
+		// verify them via resp.Request.URL on the client side. The body is a
+		// JSON array to match the generated client's []string return type.
+		json.NewEncoder(w).Encode([]string{
+			"q=" + r.URL.Query().Get("q"),
+			"limit=" + r.URL.Query().Get("limit"),
+			"cursor=" + r.URL.Query().Get("cursor"),
+		})
+	}))
+	defer server.Close()
+
+	if err := os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644); err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	prog := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/requiredquerybehaviorapiclient"
+)
+
+func main() {
+	client := requiredquerybehaviorapiclient.NewWithClient("%s", &http.Client{Timeout: 5 * time.Second})
+
+	resp, _, err := client.ListSearch(context.Background(), "hello world", 25,
+		requiredquerybehaviorapiclient.WithOptions(requiredquerybehaviorapiclient.ListSearchOptions{
+			Cursor: "abc",
+		}))
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"url":    resp.Request.URL.String(),
+		"status": resp.StatusCode,
+	})
+}
+`, server.URL)
+
+	if err := os.WriteFile("main.go", []byte(prog), 0644); err != nil {
+		t.Fatalf("Failed to write test program: %v", err)
+	}
+
+	output, err := runGoProgram("main.go")
+	if err != nil {
+		t.Fatalf("Test program failed: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+	}
+
+	requestURL := result["url"].(string)
+	if !strings.Contains(requestURL, "q=hello+world") && !strings.Contains(requestURL, "q=hello%20world") {
+		t.Errorf("Expected URL to contain encoded q param, got: %s", requestURL)
+	}
+	if !strings.Contains(requestURL, "limit=25") {
+		t.Errorf("Expected URL to contain limit=25, got: %s", requestURL)
+	}
+	if !strings.Contains(requestURL, "cursor=abc") {
+		t.Errorf("Expected optional cursor=abc to still flow through, got: %s", requestURL)
+	}
+}
+
+func TestRequiredQueryParamsWithDefaultDemoted(t *testing.T) {
+	// A query param marked required:"true" but also carrying a default value is
+	// effectively optional on the wire (the server fills it in), so the
+	// generated client should keep it in the options struct rather than
+	// promoting it to a required positional argument.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Required With Default API", "1.0.0"))
+
+	huma.Get(api, "/search", func(ctx context.Context, input *struct {
+		Query string `query:"q" required:"true"`
+		Limit int    `query:"limit" required:"true" default:"10"`
+	}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_required_with_default_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	content, err := os.ReadFile("requiredwithdefaultapiclient/client.go")
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+	clientCode := string(content)
+
+	// q has no default → required positional arg.
+	// limit has a default → demoted to the options struct.
+	if !strings.Contains(clientCode, "ListSearch(ctx context.Context, q string, opts ...Option)") {
+		t.Errorf("Expected ListSearch to keep q as a required arg and demote limit, got:\n%s", clientCode)
+	}
+	if strings.Contains(clientCode, "limit int64, opts") {
+		t.Errorf("Did not expect limit to remain a required positional arg when a default is set")
+	}
+
+	idx := strings.Index(clientCode, "type ListSearchOptions struct")
+	if idx < 0 {
+		t.Fatalf("Expected ListSearchOptions struct for demoted limit field")
+	}
+	end := strings.Index(clientCode[idx:], "}")
+	optsBlock := clientCode[idx : idx+end]
+	if !strings.Contains(optsBlock, "Limit ") {
+		t.Errorf("Expected demoted Limit field in options struct, got:\n%s", optsBlock)
+	}
+}
+
+func TestRequiredQueryParamsOverridePrecedence(t *testing.T) {
+	// Required positional args must win over caller-supplied overrides via
+	// WithQuery, so the typed API contract stays authoritative.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Required Query Precedence API", "1.0.0"))
+
+	huma.Get(api, "/search", func(ctx context.Context, input *struct {
+		Query string `query:"q" required:"true"`
+	}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_required_query_precedence_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]string{"q=" + r.URL.Query().Get("q")})
+	}))
+	defer server.Close()
+
+	if err := os.WriteFile("go.mod", []byte("module testprogram\ngo 1.23\n"), 0644); err != nil {
+		t.Fatalf("Failed to create go.mod: %v", err)
+	}
+
+	prog := fmt.Sprintf(`
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+	"testprogram/requiredqueryprecedenceapiclient"
+)
+
+func main() {
+	client := requiredqueryprecedenceapiclient.NewWithClient("%s", &http.Client{Timeout: 5 * time.Second})
+
+	resp, _, err := client.ListSearch(context.Background(), "authoritative",
+		requiredqueryprecedenceapiclient.WithQuery("q", "override-attempt"))
+	if err != nil {
+		fmt.Printf("ERROR: %%v\n", err)
+		os.Exit(1)
+	}
+
+	json.NewEncoder(os.Stdout).Encode(map[string]any{"url": resp.Request.URL.String()})
+}
+`, server.URL)
+
+	if err := os.WriteFile("main.go", []byte(prog), 0644); err != nil {
+		t.Fatalf("Failed to write test program: %v", err)
+	}
+
+	output, err := runGoProgram("main.go")
+	if err != nil {
+		t.Fatalf("Test program failed: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("Failed to parse output: %v\nRaw: %s", err, output)
+	}
+
+	requestURL := result["url"].(string)
+	if !strings.Contains(requestURL, "q=authoritative") {
+		t.Errorf("Expected required positional arg to win over WithQuery override, got: %s", requestURL)
+	}
+	if strings.Contains(requestURL, "q=override-attempt") {
+		t.Errorf("WithQuery should not have overridden the required positional arg, got: %s", requestURL)
+	}
+}
