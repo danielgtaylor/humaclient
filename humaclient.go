@@ -1859,8 +1859,7 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- end}}
 	}
 
-	// Apply custom query parameters first so that required query parameters
-	// below take precedence over any caller-supplied overrides.
+	// Apply query parameters
 	reqOpts.applyQueryParams(u)
 {{- if .RequiredQueryParams}}
 
