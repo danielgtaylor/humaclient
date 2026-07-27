@@ -1002,20 +1002,29 @@ func createParamData(param *huma.Param, openapi *huma.OpenAPI, allowedPackages [
 	return paramData
 }
 
-// addToOptionsIfNotExists adds a parameter to options if it doesn't already exist
+// addToOptionsIfNotExists adds a parameter to the operation's own options
+// (deduped within that operation) and records it in the client-wide set.
+//
+// The per-operation list must not be gated on the client-wide set — two
+// operations can share an optional parameter and both need it in their own
+// options struct.
 func addToOptionsIfNotExists(allOptions map[string]OptionField, operationOptions *[]OptionField, paramData ParamData, paramIn string) {
 	optKey := fmt.Sprintf("%s_%s", paramData.GoName, paramIn)
-	if _, exists := allOptions[optKey]; !exists {
-		optField := OptionField{
-			Name:     paramData.GoName,
-			Type:     paramData.Type,
-			JSONName: paramData.Name,
-			Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", paramData.Name),
-			In:       paramIn,
-		}
-		allOptions[optKey] = optField
-		*operationOptions = append(*operationOptions, optField)
+	optField := OptionField{
+		Name:     paramData.GoName,
+		Type:     paramData.Type,
+		JSONName: paramData.Name,
+		Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", paramData.Name),
+		In:       paramIn,
 	}
+	allOptions[optKey] = optField
+
+	for _, existing := range *operationOptions {
+		if existing.Name == optField.Name && existing.In == optField.In {
+			return
+		}
+	}
+	*operationOptions = append(*operationOptions, optField)
 }
 
 // hasRequestBodies checks if any operation in the API has request bodies

@@ -5138,6 +5138,77 @@ func TestRequiredQueryParams(t *testing.T) {
 	})
 }
 
+func TestOptionalQueryParamsSharedAcrossOperations(t *testing.T) {
+	// Regression: two operations each declare an optional query parameter with
+	// the same name. Each operation's options struct must include the shared
+	// parameter — it must not be stolen by whichever operation is generated
+	// first through the client-wide option set.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Shared Optional API", "1.0.0"))
+
+	huma.Get(api, "/first", func(ctx context.Context, input *struct {
+		Shared string `query:"shared" doc:"Shared optional filter"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: input.Shared}, nil
+	})
+
+	huma.Get(api, "/second", func(ctx context.Context, input *struct {
+		Shared string `query:"shared" doc:"Shared optional filter"`
+		Extra  string `query:"extra" doc:"Second-only optional"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: input.Shared + input.Extra}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_shared_optional_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	clientFile := "sharedoptionalapiclient/client.go"
+	content, err := os.ReadFile(clientFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
+	clientCode := string(content)
+
+	// Both operations must carry the shared optional in their own options struct;
+	// the second must also keep its own-only optional.
+	assertOptionsField(t, clientCode, "GetFirstOptions", "Shared")
+	assertOptionsField(t, clientCode, "GetSecondOptions", "Shared")
+	assertOptionsField(t, clientCode, "GetSecondOptions", "Extra")
+
+	fset := token.NewFileSet()
+	if _, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments); err != nil {
+		t.Fatalf("Generated client has syntax errors: %v", err)
+	}
+}
+
+// assertOptionsField fails unless the named options struct in the generated
+// client contains the given field.
+func assertOptionsField(t *testing.T, clientCode, structName, field string) {
+	t.Helper()
+	idx := strings.Index(clientCode, "type "+structName+" struct")
+	if idx < 0 {
+		t.Fatalf("expected %s to exist in generated client:\n%s", structName, clientCode)
+	}
+	end := strings.Index(clientCode[idx:], "}")
+	if end <= 0 {
+		t.Fatalf("malformed %s struct in generated client", structName)
+	}
+	if block := clientCode[idx : idx+end]; !strings.Contains(block, field+" ") {
+		t.Errorf("expected %s field in %s, got:\n%s", field, structName, block)
+	}
+}
+
 func TestRequiredQueryParamsBehavior(t *testing.T) {
 	// Generate a client with required query params and exercise it against a
 	// real test server to verify required values land on the wire.
