@@ -5173,40 +5173,174 @@ func TestOptionalQueryParamsSharedAcrossOperations(t *testing.T) {
 		t.Fatalf("Failed to generate client: %v", err)
 	}
 
-	clientFile := "sharedoptionalapiclient/client.go"
+	file := parseGeneratedClient(t, "sharedoptionalapiclient/client.go")
+
+	// Both operations must carry the shared optional in their own options struct;
+	// the second must also keep its own-only optional.
+	assertOptionsField(t, file, "GetFirstOptions", "Shared")
+	assertOptionsField(t, file, "GetSecondOptions", "Shared")
+	assertOptionsField(t, file, "GetSecondOptions", "Extra")
+}
+
+func TestOptionalParamNameCollisionWithinOperation(t *testing.T) {
+	// Regression: an options struct cannot declare the same field twice, so an
+	// operation with an optional query and header that camel-case to the same name
+	// must disambiguate them. Emitting both as Filter yields "Filter redeclared"
+	// and the generated package no longer compiles.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Collision API", "1.0.0"))
+
+	huma.Get(api, "/first", func(ctx context.Context, input *struct {
+		Filter string `query:"filter" doc:"Optional filter"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: input.Filter}, nil
+	})
+
+	huma.Get(api, "/second", func(ctx context.Context, input *struct {
+		Filter       string `query:"filter" doc:"Optional filter"`
+		FilterHeader string `header:"filter" doc:"Same name, different location"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: input.Filter + input.FilterHeader}, nil
+	})
+
+	// Same collision, declared the other way round: the generated names must not
+	// depend on which parameter the input struct happens to list first.
+	huma.Get(api, "/third", func(ctx context.Context, input *struct {
+		FilterHeader string `header:"filter" doc:"Same name, different location"`
+		Filter       string `query:"filter" doc:"Optional filter"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: input.Filter + input.FilterHeader}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_collision_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	file := parseGeneratedClient(t, "collisionapiclient/client.go")
+
+	// Neither parameter is dropped: the query keeps the bare name and the header
+	// takes a location suffix, in both declaration orders.
+	assertOptionsField(t, file, "GetFirstOptions", "Filter")
+	assertOptionsField(t, file, "GetSecondOptions", "Filter")
+	assertOptionsField(t, file, "GetSecondOptions", "FilterHeader")
+	assertOptionsField(t, file, "GetThirdOptions", "Filter")
+	assertOptionsField(t, file, "GetThirdOptions", "FilterHeader")
+
+	// The suffix only renames the Go field; both still go out under "filter", one
+	// as a query parameter and one as a header.
+	assertOptionApplies(t, "collisionapiclient/client.go", "GetSecondOptions", `opts.CustomQuery["filter"] = o.Filter`)
+	assertOptionApplies(t, "collisionapiclient/client.go", "GetSecondOptions", `opts.CustomHeaders["filter"] = o.FilterHeader`)
+	assertOptionApplies(t, "collisionapiclient/client.go", "GetThirdOptions", `opts.CustomQuery["filter"] = o.Filter`)
+	assertOptionApplies(t, "collisionapiclient/client.go", "GetThirdOptions", `opts.CustomHeaders["filter"] = o.FilterHeader`)
+}
+
+// assertOptionApplies fails unless the named options struct's Apply method
+// contains the given statement.
+func assertOptionApplies(t *testing.T, clientFile, structName, statement string) {
+	t.Helper()
 	content, err := os.ReadFile(clientFile)
 	if err != nil {
 		t.Fatalf("Failed to read generated client: %v", err)
 	}
-	clientCode := string(content)
+	marker := "func (o " + structName + ") Apply(opts *RequestOptions) {"
+	start := strings.Index(string(content), marker)
+	if start < 0 {
+		t.Fatalf("expected %s to have an Apply method", structName)
+	}
+	body := string(content)[start:]
+	if end := strings.Index(body, "\n}\n"); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, statement) {
+		t.Errorf("expected %s.Apply to contain %q, got:\n%s", structName, statement, body)
+	}
+}
 
-	// Both operations must carry the shared optional in their own options struct;
-	// the second must also keep its own-only optional.
-	assertOptionsField(t, clientCode, "GetFirstOptions", "Shared")
-	assertOptionsField(t, clientCode, "GetSecondOptions", "Shared")
-	assertOptionsField(t, clientCode, "GetSecondOptions", "Extra")
+// parseGeneratedClient parses and compiles the generated client, failing the
+// test on either a syntax error or a duplicate struct field. The duplicate check
+// is worth doing explicitly: it is a type error rather than a syntax one, so it
+// survives a plain parse, and it points at the generator bug more directly than
+// the compiler output does.
+func parseGeneratedClient(t *testing.T, clientFile string) *ast.File {
+	t.Helper()
+
+	content, err := os.ReadFile(clientFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated client: %v", err)
+	}
 
 	fset := token.NewFileSet()
-	if _, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments); err != nil {
+	file, err := parser.ParseFile(fset, clientFile, content, parser.ParseComments)
+	if err != nil {
 		t.Fatalf("Generated client has syntax errors: %v", err)
 	}
+
+	for name, fields := range structFields(file) {
+		seen := make(map[string]bool, len(fields))
+		for _, field := range fields {
+			if seen[field] {
+				t.Errorf("Generated struct %s declares field %s twice, so it will not compile", name, field)
+			}
+			seen[field] = true
+		}
+	}
+
+	if out, err := exec.Command("go", "build", clientFile).CombinedOutput(); err != nil {
+		t.Fatalf("Generated client failed to compile: %v\nOutput: %s", err, out)
+	}
+
+	return file
+}
+
+// structFields maps every named struct type in the file to its field names, in
+// declaration order.
+func structFields(file *ast.File) map[string][]string {
+	fields := make(map[string][]string)
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.TypeSpec)
+		if !ok {
+			return true
+		}
+		structType, ok := spec.Type.(*ast.StructType)
+		if !ok {
+			return true
+		}
+		names := []string{}
+		for _, field := range structType.Fields.List {
+			for _, name := range field.Names {
+				names = append(names, name.Name)
+			}
+		}
+		fields[spec.Name.Name] = names
+		return true
+	})
+	return fields
 }
 
 // assertOptionsField fails unless the named options struct in the generated
 // client contains the given field.
-func assertOptionsField(t *testing.T, clientCode, structName, field string) {
+func assertOptionsField(t *testing.T, file *ast.File, structName, field string) {
 	t.Helper()
-	idx := strings.Index(clientCode, "type "+structName+" struct")
-	if idx < 0 {
-		t.Fatalf("expected %s to exist in generated client:\n%s", structName, clientCode)
+	names, ok := structFields(file)[structName]
+	if !ok {
+		t.Fatalf("expected %s to exist in generated client", structName)
 	}
-	end := strings.Index(clientCode[idx:], "}")
-	if end <= 0 {
-		t.Fatalf("malformed %s struct in generated client", structName)
+	for _, name := range names {
+		if name == field {
+			return
+		}
 	}
-	if block := clientCode[idx : idx+end]; !strings.Contains(block, field+" ") {
-		t.Errorf("expected %s field in %s, got:\n%s", field, structName, block)
-	}
+	t.Errorf("expected %s field in %s, got %v", field, structName, names)
 }
 
 func TestRequiredQueryParamsBehavior(t *testing.T) {
