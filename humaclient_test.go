@@ -5228,20 +5228,87 @@ func TestOptionalParamNameCollisionWithinOperation(t *testing.T) {
 
 	file := parseGeneratedClient(t, "collisionapiclient/client.go")
 
-	// Neither parameter is dropped: the query keeps the bare name and the header
-	// takes a location suffix, in both declaration orders.
+	// An operation whose parameter does not clash is untouched.
 	assertOptionsField(t, file, "GetFirstOptions", "Filter")
-	assertOptionsField(t, file, "GetSecondOptions", "Filter")
-	assertOptionsField(t, file, "GetSecondOptions", "FilterHeader")
-	assertOptionsField(t, file, "GetThirdOptions", "Filter")
-	assertOptionsField(t, file, "GetThirdOptions", "FilterHeader")
+
+	// Neither parameter is dropped, and neither keeps the bare name: code written
+	// against an earlier client fails to compile rather than silently sending its
+	// value to the other location.
+	for _, structName := range []string{"GetSecondOptions", "GetThirdOptions"} {
+		assertOptionsField(t, file, structName, "FilterQuery")
+		assertOptionsField(t, file, structName, "FilterHeader")
+		assertNoOptionsField(t, file, structName, "Filter")
+	}
 
 	// The suffix only renames the Go field; both still go out under "filter", one
-	// as a query parameter and one as a header.
-	assertOptionApplies(t, "collisionapiclient/client.go", "GetSecondOptions", `opts.CustomQuery["filter"] = o.Filter`)
-	assertOptionApplies(t, "collisionapiclient/client.go", "GetSecondOptions", `opts.CustomHeaders["filter"] = o.FilterHeader`)
-	assertOptionApplies(t, "collisionapiclient/client.go", "GetThirdOptions", `opts.CustomQuery["filter"] = o.Filter`)
-	assertOptionApplies(t, "collisionapiclient/client.go", "GetThirdOptions", `opts.CustomHeaders["filter"] = o.FilterHeader`)
+	// as a query parameter and one as a header, in both declaration orders.
+	for _, structName := range []string{"GetSecondOptions", "GetThirdOptions"} {
+		assertOptionApplies(t, "collisionapiclient/client.go", structName, `opts.CustomQuery["filter"] = o.FilterQuery`)
+		assertOptionApplies(t, "collisionapiclient/client.go", structName, `opts.CustomHeaders["filter"] = o.FilterHeader`)
+	}
+}
+
+func TestOptionalParamNameCollisionSameLocation(t *testing.T) {
+	// Two optional query parameters can camel-case to the same Go name, which the
+	// location suffix alone does not separate. Both must survive, and which one
+	// takes the numbered suffix must follow from the parameter names rather than
+	// from the order the input struct happens to declare them in.
+	generate := func(t *testing.T, register func(huma.API)) {
+		t.Helper()
+
+		mux := http.NewServeMux()
+		api := humago.New(mux, huma.DefaultConfig("Same Location API", "1.0.0"))
+		register(api)
+
+		tempDir, err := os.MkdirTemp("", "humaclient_same_location_*")
+		if err != nil {
+			t.Fatalf("Failed to create temp directory: %v", err)
+		}
+		defer os.RemoveAll(tempDir)
+
+		oldDir, _ := os.Getwd()
+		os.Chdir(tempDir)
+		defer os.Chdir(oldDir)
+
+		if err := GenerateClient(api); err != nil {
+			t.Fatalf("Failed to generate client: %v", err)
+		}
+
+		clientFile := "samelocationapiclient/client.go"
+		file := parseGeneratedClient(t, clientFile)
+
+		assertOptionsField(t, file, "GetSearchOptions", "SortByHeader")
+		assertOptionsField(t, file, "GetSearchOptions", "SortByQuery")
+		assertOptionsField(t, file, "GetSearchOptions", "SortByQuery2")
+		assertNoOptionsField(t, file, "GetSearchOptions", "SortBy")
+
+		// Which query parameter takes the number follows from the wire names:
+		// "sortBy" sorts before "sort_by".
+		assertOptionApplies(t, clientFile, "GetSearchOptions", `opts.CustomQuery["sortBy"] = o.SortByQuery`)
+		assertOptionApplies(t, clientFile, "GetSearchOptions", `opts.CustomQuery["sort_by"] = o.SortByQuery2`)
+		assertOptionApplies(t, clientFile, "GetSearchOptions", `opts.CustomHeaders["sort-by"] = o.SortByHeader`)
+	}
+
+	generate(t, func(api huma.API) {
+		huma.Get(api, "/search", func(ctx context.Context, input *struct {
+			SortBySnake  string `query:"sort_by" doc:"Snake case spelling"`
+			SortByCamel  string `query:"sortBy" doc:"Camel case spelling"`
+			SortByHeader string `header:"sort-by" doc:"Same name again, as a header"`
+		}) (*struct{ Body string }, error) {
+			return &struct{ Body string }{Body: input.SortBySnake}, nil
+		})
+	})
+
+	// Same three parameters, declared in the opposite order.
+	generate(t, func(api huma.API) {
+		huma.Get(api, "/search", func(ctx context.Context, input *struct {
+			SortByHeader string `header:"sort-by" doc:"Same name again, as a header"`
+			SortByCamel  string `query:"sortBy" doc:"Camel case spelling"`
+			SortBySnake  string `query:"sort_by" doc:"Snake case spelling"`
+		}) (*struct{ Body string }, error) {
+			return &struct{ Body string }{Body: input.SortBySnake}, nil
+		})
+	})
 }
 
 // assertOptionApplies fails unless the named options struct's Apply method
@@ -5341,6 +5408,21 @@ func assertOptionsField(t *testing.T, file *ast.File, structName, field string) 
 		}
 	}
 	t.Errorf("expected %s field in %s, got %v", field, structName, names)
+}
+
+// assertNoOptionsField fails if the named options struct contains the given
+// field.
+func assertNoOptionsField(t *testing.T, file *ast.File, structName, field string) {
+	t.Helper()
+	names, ok := structFields(file)[structName]
+	if !ok {
+		t.Fatalf("expected %s to exist in generated client", structName)
+	}
+	for _, name := range names {
+		if name == field {
+			t.Errorf("expected %s not to have a %s field, got %v", structName, field, names)
+		}
+	}
 }
 
 func TestRequiredQueryParamsBehavior(t *testing.T) {

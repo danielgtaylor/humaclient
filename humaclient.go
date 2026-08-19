@@ -1020,28 +1020,48 @@ func addOperationOption(operationOptions *[]OptionField, paramData ParamData, pa
 //
 // Distinct parameters can camel-case to the same Go name — a query and a header
 // both called "filter", say — but a struct cannot declare the same field twice,
-// and dropping one would quietly leave a documented parameter unreachable. Query
-// parameters keep the bare name and anything clashing takes a location suffix
-// (Filter, FilterHeader), so the generated names follow from the parameters
-// themselves rather than from the order they happen to be declared in.
+// and dropping one would quietly leave a documented parameter unreachable. Every
+// parameter in a clash takes a location suffix (FilterQuery, FilterHeader) and
+// none of them keeps the bare name: leaving it on one of the two would let code
+// written against an earlier generated client keep compiling while quietly
+// moving its value from a header to a query parameter, or the reverse.
 func resolveOptionNames(options []OptionField) {
+	counts := make(map[string]int, len(options))
+	for _, opt := range options {
+		counts[opt.Name]++
+	}
+
+	// Names nothing clashes with are kept as-is and reserved up front, so a
+	// suffixed name can never displace a parameter that asked for it directly.
 	taken := make(map[string]bool, len(options))
-	for _, in := range []string{"query", "header"} {
-		for i := range options {
-			if options[i].In == in {
-				options[i].Name = uniqueOptionName(options[i].Name, in, taken)
-			}
+	var clashing []int
+	for i, opt := range options {
+		if counts[opt.Name] == 1 {
+			taken[opt.Name] = true
+			continue
 		}
+		clashing = append(clashing, i)
+	}
+
+	// Resolve in a fixed order — location, then wire name — rather than in the
+	// order the parameters happen to be declared in, so reordering fields in the
+	// server's input struct regenerates an identical client.
+	sort.Slice(clashing, func(a, b int) bool {
+		x, y := options[clashing[a]], options[clashing[b]]
+		if x.In != y.In {
+			return x.In < y.In
+		}
+		return x.JSONName < y.JSONName
+	})
+	for _, i := range clashing {
+		options[i].Name = uniqueOptionName(options[i].Name, options[i].In, taken)
 	}
 }
 
-// uniqueOptionName returns base, or base plus a disambiguating suffix when base
-// is already taken, and records the result as taken.
+// uniqueOptionName returns base plus a location suffix, numbered if two
+// parameters in the same location still collide, and records it as taken.
 func uniqueOptionName(base, paramIn string, taken map[string]bool) string {
-	name := base
-	if taken[name] {
-		name = base + casing.Camel(paramIn)
-	}
+	name := base + casing.Camel(paramIn)
 	for i := 2; taken[name]; i++ {
 		name = fmt.Sprintf("%s%s%d", base, casing.Camel(paramIn), i)
 	}
