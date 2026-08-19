@@ -218,6 +218,19 @@ client.ListThings(ctx, exampleapiclient.WithOptions(exampleapiclient.ListThingsO
 }))
 ```
 
+Every operation gets its own options struct, so an optional parameter shared by several operations appears on each of them.
+
+Where two optional parameters of one operation would produce the same Go field name — a query and a header both named `filter`, say — each takes a suffix naming its location, and neither keeps the bare name:
+
+```go
+type GetThingsOptions struct {
+	FilterQuery  string `json:"filter,omitempty"`
+	FilterHeader string `json:"filter,omitempty"`
+}
+```
+
+Only the Go field is renamed; each parameter still goes out under its own name, in its own location. If you were previously passing one of these through `WithOptions(FooOptions{Filter: ...})`, that call site will fail to compile when you regenerate, and you will need to name the location you meant. Earlier versions of the generator dropped one of the two parameters in this situation, so the field you were setting may not be the one you expected.
+
 ### Autopatch / JSON Merge Patch
 
 Huma's [autopatch](https://huma.rocks/features/auto-patch/) feature automatically generates PATCH operations from GET + PUT pairs using `application/merge-patch+json`. The client generator detects these operations and generates a `Patchable` interface with two implementations:

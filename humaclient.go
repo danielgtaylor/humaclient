@@ -51,7 +51,6 @@ type ClientTemplateData struct {
 	ExternalImports     []string // External packages that are allowed to be referenced
 	Schemas             []SchemaData
 	Operations          []OperationData
-	RequestOptionFields []OptionField
 	HasRequestBodies    bool
 	HasMergePatch       bool // Whether any operation supports both merge-patch+json and json-patch+json (autopatch)
 	HasJSONPatchOp      bool // Whether JSONPatchOp already exists as a schema struct
@@ -274,7 +273,7 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 	}
 
 	// Generate operations
-	if err := buildOperations(&data.Operations, &data.RequestOptionFields, openapi, opts.AllowedPackages, externalImports, currentPkgPath, opts.Pagination); err != nil {
+	if err := buildOperations(&data.Operations, openapi, opts.AllowedPackages, externalImports, currentPkgPath, opts.Pagination); err != nil {
 		return nil, fmt.Errorf("failed to build operations: %w", err)
 	}
 
@@ -685,9 +684,7 @@ func buildHumaTags(schema *huma.Schema) string {
 }
 
 // buildOperations generates operation data from OpenAPI paths
-func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string, pagination *PaginationOptions) error {
-	allOptions := make(map[string]OptionField)
-
+func buildOperations(operations *[]OperationData, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string, pagination *PaginationOptions) error {
 	paths := getSortedPaths(openapi.Paths)
 
 	for _, path := range paths {
@@ -698,7 +695,7 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 				continue
 			}
 
-			opData, err := createOperationData(operation, method, path, openapi, allowedPackages, externalImports, allOptions, currentPkgPath, pagination)
+			opData, err := createOperationData(operation, method, path, openapi, allowedPackages, externalImports, currentPkgPath, pagination)
 			if err != nil {
 				return fmt.Errorf("failed to create operation data for %s %s: %w", method, path, err)
 			}
@@ -706,14 +703,6 @@ func buildOperations(operations *[]OperationData, globalOptions *[]OptionField, 
 			*operations = append(*operations, opData)
 		}
 	}
-
-	// Convert global options map to slice and sort
-	for _, opt := range allOptions {
-		*globalOptions = append(*globalOptions, opt)
-	}
-	sort.Slice(*globalOptions, func(i, j int) bool {
-		return (*globalOptions)[i].Name < (*globalOptions)[j].Name
-	})
 
 	return nil
 }
@@ -747,7 +736,7 @@ func getOperationForMethod(pathItem *huma.PathItem, method string) *huma.Operati
 }
 
 // createOperationData creates an OperationData from operation details
-func createOperationData(operation *huma.Operation, method, path string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, allOptions map[string]OptionField, currentPkgPath string, pagination *PaginationOptions) (OperationData, error) {
+func createOperationData(operation *huma.Operation, method, path string, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string, pagination *PaginationOptions) (OperationData, error) {
 	opData := OperationData{
 		MethodName: generateMethodName(operation),
 		HTTPMethod: method,
@@ -768,7 +757,7 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath, pagination)
 
 	// Handle parameters
-	if err := buildOperationParams(&opData, operation, allOptions, openapi, allowedPackages, externalImports, currentPkgPath); err != nil {
+	if err := buildOperationParams(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath); err != nil {
 		return opData, err
 	}
 
@@ -948,7 +937,7 @@ func handlePagination(opData *OperationData, operation *huma.Operation, openapi 
 }
 
 // buildOperationParams builds parameter data for an operation
-func buildOperationParams(opData *OperationData, operation *huma.Operation, allOptions map[string]OptionField, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
+func buildOperationParams(opData *OperationData, operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) error {
 	if operation.Parameters == nil {
 		return nil
 	}
@@ -967,15 +956,17 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, allO
 			if paramData.Required && !hasDefault {
 				opData.RequiredQueryParams = append(opData.RequiredQueryParams, paramData)
 			} else {
-				addToOptionsIfNotExists(allOptions, &opData.OptionsFields, paramData, "query")
+				addOperationOption(&opData.OptionsFields, paramData, "query")
 			}
 
 		case "header":
 			opData.HasHeaderParams = true
 			opData.HeaderParams = append(opData.HeaderParams, paramData)
-			addToOptionsIfNotExists(allOptions, &opData.OptionsFields, paramData, "header")
+			addOperationOption(&opData.OptionsFields, paramData, "header")
 		}
 	}
+
+	resolveOptionNames(opData.OptionsFields)
 
 	// Generate operation-specific options struct name if needed
 	if len(opData.OptionsFields) > 0 {
@@ -1002,20 +993,80 @@ func createParamData(param *huma.Param, openapi *huma.OpenAPI, allowedPackages [
 	return paramData
 }
 
-// addToOptionsIfNotExists adds a parameter to options if it doesn't already exist
-func addToOptionsIfNotExists(allOptions map[string]OptionField, operationOptions *[]OptionField, paramData ParamData, paramIn string) {
-	optKey := fmt.Sprintf("%s_%s", paramData.GoName, paramIn)
-	if _, exists := allOptions[optKey]; !exists {
-		optField := OptionField{
-			Name:     paramData.GoName,
-			Type:     paramData.Type,
-			JSONName: paramData.Name,
-			Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", paramData.Name),
-			In:       paramIn,
+// addOperationOption adds an optional parameter to the operation's own options,
+// skipping it if the same parameter is already there.
+//
+// Two operations can share an optional parameter and both need it in their own
+// options struct, so this must not be gated on anything client-wide. Sameness is
+// the wire name plus the location, which is what actually identifies a parameter;
+// clashing Go field names are sorted out later by resolveOptionNames.
+func addOperationOption(operationOptions *[]OptionField, paramData ParamData, paramIn string) {
+	for _, existing := range *operationOptions {
+		if existing.JSONName == paramData.Name && existing.In == paramIn {
+			return
 		}
-		allOptions[optKey] = optField
-		*operationOptions = append(*operationOptions, optField)
 	}
+	*operationOptions = append(*operationOptions, OptionField{
+		Name:     paramData.GoName,
+		Type:     paramData.Type,
+		JSONName: paramData.Name,
+		Tag:      fmt.Sprintf("`json:\"%s,omitempty\"`", paramData.Name),
+		In:       paramIn,
+	})
+}
+
+// resolveOptionNames makes the option field names unique within one operation's
+// options struct.
+//
+// Distinct parameters can camel-case to the same Go name — a query and a header
+// both called "filter", say — but a struct cannot declare the same field twice,
+// and dropping one would quietly leave a documented parameter unreachable. Every
+// parameter in a clash takes a location suffix (FilterQuery, FilterHeader) and
+// none of them keeps the bare name: leaving it on one of the two would let code
+// written against an earlier generated client keep compiling while quietly
+// moving its value from a header to a query parameter, or the reverse.
+func resolveOptionNames(options []OptionField) {
+	counts := make(map[string]int, len(options))
+	for _, opt := range options {
+		counts[opt.Name]++
+	}
+
+	// Names nothing clashes with are kept as-is and reserved up front, so a
+	// suffixed name can never displace a parameter that asked for it directly.
+	taken := make(map[string]bool, len(options))
+	var clashing []int
+	for i, opt := range options {
+		if counts[opt.Name] == 1 {
+			taken[opt.Name] = true
+			continue
+		}
+		clashing = append(clashing, i)
+	}
+
+	// Resolve in a fixed order — location, then wire name — rather than in the
+	// order the parameters happen to be declared in, so reordering fields in the
+	// server's input struct regenerates an identical client.
+	sort.Slice(clashing, func(a, b int) bool {
+		x, y := options[clashing[a]], options[clashing[b]]
+		if x.In != y.In {
+			return x.In < y.In
+		}
+		return x.JSONName < y.JSONName
+	})
+	for _, i := range clashing {
+		options[i].Name = uniqueOptionName(options[i].Name, options[i].In, taken)
+	}
+}
+
+// uniqueOptionName returns base plus a location suffix, numbered if two
+// parameters in the same location still collide, and records it as taken.
+func uniqueOptionName(base, paramIn string, taken map[string]bool) string {
+	name := base + casing.Camel(paramIn)
+	for i := 2; taken[name]; i++ {
+		name = fmt.Sprintf("%s%s%d", base, casing.Camel(paramIn), i)
+	}
+	taken[name] = true
+	return name
 }
 
 // hasRequestBodies checks if any operation in the API has request bodies
