@@ -56,6 +56,7 @@ type ClientTemplateData struct {
 	HasJSONPatchOp      bool // Whether JSONPatchOp already exists as a schema struct
 	HasSSE              bool // Whether any operation uses Server-Sent Events
 	HasListParams       bool // Whether any optional parameter is list-valued and needs joining
+	HasTimeListParams   bool // Whether any list-valued parameter has date-time elements
 }
 
 // SchemaData represents an OpenAPI schema for code generation
@@ -312,11 +313,17 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 		for _, f := range op.OptionsFields {
 			if isListType(f.Type) {
 				data.HasListParams = true
+				if f.Type == "[]time.Time" {
+					data.HasTimeListParams = true
+				}
 			}
 		}
 		for _, p := range op.RequiredQueryParams {
 			if isListType(p.Type) {
 				data.HasListParams = true
+				if p.Type == "[]time.Time" {
+					data.HasTimeListParams = true
+				}
 			}
 		}
 	}
@@ -1720,16 +1727,21 @@ func WithOptions(applier OptionsApplier) Option {
 	}
 }
 // bodyAllowedForStatus reports whether a response with the given status code is
-// permitted to carry content. Informational (1xx), 204 No Content, and 304 Not
-// Modified responses never do (RFC 9110), so there is nothing to decode and the
-// returned result is left as its zero value. The operation still succeeded: inspect
-// the returned *http.Response to tell these apart from a 200. This mirrors
-// net/http's own bodyAllowedForStatus.
+// permitted to carry content. Informational (1xx), 204 No Content, 205 Reset Content,
+// and 304 Not Modified never do, so there is nothing to decode and the returned
+// result is left as its zero value. The operation still succeeded: inspect the
+// returned *http.Response to tell these apart from a 200.
+//
+// This follows RFC 9110, which says of each of these that it "cannot contain
+// content". net/http's own unexported bodyAllowedForStatus omits 205; that is the
+// only difference, and it is deliberate.
 func bodyAllowedForStatus(status int) bool {
 	switch {
 	case status >= 100 && status <= 199:
 		return false
 	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusResetContent:
 		return false
 	case status == http.StatusNotModified:
 		return false
@@ -1743,7 +1755,17 @@ func bodyAllowedForStatus(status int) bool {
 func joinParamValues[T any](values []T) string {
 	parts := make([]string, len(values))
 	for i, v := range values {
-		parts[i] = fmt.Sprintf("%v", v)
+		switch e := any(v).(type) {
+{{- if .HasTimeListParams}}
+		case time.Time:
+			// The layout the server parses, matching the scalar date-time case.
+			parts[i] = e.Format(time.RFC3339Nano)
+{{- end}}
+		case string:
+			parts[i] = e
+		default:
+			parts[i] = fmt.Sprintf("%v", e)
+		}
 	}
 	return strings.Join(parts, ",")
 }

@@ -126,16 +126,21 @@ func WithOptions(applier OptionsApplier) Option {
 }
 
 // bodyAllowedForStatus reports whether a response with the given status code is
-// permitted to carry content. Informational (1xx), 204 No Content, and 304 Not
-// Modified responses never do (RFC 9110), so there is nothing to decode and the
-// returned result is left as its zero value. The operation still succeeded: inspect
-// the returned *http.Response to tell these apart from a 200. This mirrors
-// net/http's own bodyAllowedForStatus.
+// permitted to carry content. Informational (1xx), 204 No Content, 205 Reset Content,
+// and 304 Not Modified never do, so there is nothing to decode and the returned
+// result is left as its zero value. The operation still succeeded: inspect the
+// returned *http.Response to tell these apart from a 200.
+//
+// This follows RFC 9110, which says of each of these that it "cannot contain
+// content". net/http's own unexported bodyAllowedForStatus omits 205; that is the
+// only difference, and it is deliberate.
 func bodyAllowedForStatus(status int) bool {
 	switch {
 	case status >= 100 && status <= 199:
 		return false
 	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusResetContent:
 		return false
 	case status == http.StatusNotModified:
 		return false

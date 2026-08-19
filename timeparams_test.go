@@ -129,3 +129,77 @@ func main() {
 		t.Errorf("server parsed %v, want %v", seen, want)
 	}
 }
+
+// timeListParamAPI has a list-valued date-time parameter, which renders through
+// joinParamValues rather than through the scalar date-time arm.
+func timeListParamAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Time List API", "1.0.0"))
+
+	huma.Get(api, "/windows", func(ctx context.Context, input *struct {
+		At []time.Time `query:"at" doc:"Instants of interest"`
+	}) (*struct {
+		Body struct {
+			Count int `json:"count"`
+		}
+	}, error) {
+		return nil, nil
+	})
+	return api
+}
+
+// TestTimeListParamElementsAreFormatted covers date-times inside a list. Fixing the
+// scalar arm alone left this path stringifying each element with %v, so a
+// []time.Time still sent Go's layout and still drew a 422 — the same bug one level
+// down.
+func TestTimeListParamElementsAreFormatted(t *testing.T) {
+	src := generateInto(t, timeListParamAPI(), "timelistapiclient")
+
+	if !strings.Contains(src, "case time.Time:") {
+		t.Error("joinParamValues does not special-case date-time elements")
+	}
+
+	var mu sync.Mutex
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = r.URL.Query().Get("at")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"count": 1})
+	}))
+	t.Cleanup(server.Close)
+
+	prog := `package main
+import ("context";"fmt";"os";"time";c "testprogram/timelistapiclient")
+func main() {
+	cl := c.New(os.Args[1])
+	a := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	b := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
+	_, _, err := cl.GetWindows(context.Background(), c.WithOptions(c.GetWindowsOptions{At: []time.Time{a, b}}))
+	if err != nil { fmt.Println("ERR", err); os.Exit(1) }
+}`
+	runGeneratedProgram(t, prog, server.URL)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, part := range strings.Split(got, ",") {
+		if _, err := time.Parse(time.RFC3339Nano, part); err != nil {
+			t.Errorf("list element %q is not RFC 3339 (full value %q): %v", part, got, err)
+		}
+	}
+}
+
+// TestJoinHelperOmitsTimeCaseWithoutTimeLists guards the import gate: the generated
+// client imports "time" only when a type needs it, so referencing time.Time in the
+// helper unconditionally would break every client that has a list param but no
+// date-time.
+func TestJoinHelperOmitsTimeCaseWithoutTimeLists(t *testing.T) {
+	src := generateInto(t, listParamAPI(), "listparamapiclient")
+	if !strings.Contains(src, "func joinParamValues") {
+		t.Fatal("precondition: helper not emitted")
+	}
+	if strings.Contains(src, "case time.Time:") {
+		t.Error("date-time case emitted for an API with no date-time list params")
+	}
+}

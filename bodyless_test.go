@@ -59,6 +59,8 @@ func TestBodylessSuccessResponses(t *testing.T) {
 		switch {
 		case r.Method == http.MethodDelete:
 			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Query().Get("reset") == "1":
+			w.WriteHeader(http.StatusResetContent)
 		case r.URL.Query().Get("nocontent") == "1":
 			// A 204 from an operation that declares a JSON body. This is the case
 			// that actually reaches the decode, unlike the DELETE below.
@@ -84,6 +86,9 @@ func main() {
 	nresp, nbody, err := cl.GetThing(ctx, c.WithQuery("nocontent", "1"))
 	fmt.Printf("declared-body-204 status=%d name=%q err=%v\n", nresp.StatusCode, nbody.Name, err)
 
+	rresp, rbody, err := cl.GetThing(ctx, c.WithQuery("reset", "1"))
+	fmt.Printf("declared-body-205 status=%d name=%q err=%v\n", rresp.StatusCode, rbody.Name, err)
+
 	_, body, err := cl.GetThing(ctx)
 	fmt.Printf("get name=%q err=%v\n", body.Name, err)
 
@@ -107,6 +112,14 @@ func main() {
 	t.Run("NoContentOnAnOperationDeclaringABodyIsNotAnError", func(t *testing.T) {
 		if !strings.Contains(out, `declared-body-204 status=204 name="" err=<nil>`) {
 			t.Errorf("want a 204 with a nil error and a zero-value body, got:\n%s", out)
+		}
+	})
+
+	// RFC 9110 says a 205 "cannot contain content" too. net/http's own helper omits
+	// it, so this is the one place the generated helper deliberately differs.
+	t.Run("ResetContentIsNotAnError", func(t *testing.T) {
+		if !strings.Contains(out, `declared-body-205 status=205 name="" err=<nil>`) {
+			t.Errorf("want a 205 with a nil error and a zero-value body, got:\n%s", out)
 		}
 	})
 
