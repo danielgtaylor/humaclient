@@ -1685,6 +1685,23 @@ func WithOptions(applier OptionsApplier) Option {
 		applier.Apply(opts)
 	}
 }
+// bodyAllowedForStatus reports whether a response with the given status code is
+// permitted to carry content. Informational (1xx), 204 No Content, and 304 Not
+// Modified responses never do (RFC 9110), so there is nothing to decode and the
+// returned result is left as its zero value. The operation still succeeded: inspect
+// the returned *http.Response to tell these apart from a 200. This mirrors
+// net/http's own bodyAllowedForStatus.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
 {{if .HasListParams}}
 // joinParamValues renders a list-valued parameter as a single comma-separated value.
 // That is the "simple" style OpenAPI applies to header parameters by default, and
@@ -2048,6 +2065,10 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- if .HasResponseBody}}
 	// Parse response body
 	var result {{trimPrefix (trimSuffix .ReturnType ", error)") "(*http.Response, "}}
+	if !bodyAllowedForStatus(resp.StatusCode) {
+		// The status carries no content, so the zero value is the result.
+		return resp, result, nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return resp, {{.ZeroValue}}, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -2117,6 +2138,10 @@ func (c *{{.ClientStructName}}) Follow(ctx context.Context, link string, result 
 	}
 
 	// Parse response body into provided result type
+	if !bodyAllowedForStatus(resp.StatusCode) {
+		// The status carries no content, so result is left untouched.
+		return resp, nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
 		return resp, fmt.Errorf("failed to decode response: %w", err)
 	}
