@@ -2045,13 +2045,16 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 		return nil, fmt.Errorf("request failed: %w", err)
 {{- end}}
 	}
-{{- if .HasResponseBody}}
+{{- if or .HasResponseBody (not .IsSSE)}}
 	defer resp.Body.Close()
+{{- else}}
+	{{/* An SSE caller reads resp.Body after this returns, so closing it here would
+	     truncate the stream. The generated ...Stream method owns closing it. */}}
 {{- end}}
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
-{{- if not .HasResponseBody}}
+{{- if and (not .HasResponseBody) .IsSSE}}
 		defer resp.Body.Close()
 {{- end}}
 		body, _ := io.ReadAll(resp.Body)
