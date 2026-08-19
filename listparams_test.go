@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -87,10 +88,15 @@ func TestListValuedParamsSentOnTheWire(t *testing.T) {
 		t.Fatal("precondition: generated client does not join list params")
 	}
 
+	// The handler runs on the server's goroutine; guard the captured values rather
+	// than relying on the request/response round trip to order them.
+	var mu sync.Mutex
 	var gotHeader, gotQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotHeader = r.Header.Get("If-Match")
 		gotQuery = r.URL.Query().Get("tags")
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"name": "ok"})
 	}))
@@ -108,10 +114,81 @@ func main() {
 }`
 	runGeneratedProgram(t, prog, server.URL)
 
+	mu.Lock()
+	defer mu.Unlock()
 	if gotHeader != `"a","b"` {
 		t.Errorf("If-Match header = %q, want %q", gotHeader, `"a","b"`)
 	}
 	if gotQuery != "x,y" {
 		t.Errorf("tags query = %q, want %q", gotQuery, "x,y")
+	}
+}
+
+// requiredListParamAPI has a list-valued query parameter that is required, so it is
+// passed as a positional argument and rendered by the required-query path rather than
+// the options struct.
+func requiredListParamAPI() huma.API {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Required List API", "1.0.0"))
+
+	huma.Register(api, huma.Operation{
+		OperationID: "search",
+		Method:      http.MethodGet,
+		Path:        "/search",
+	}, func(ctx context.Context, input *struct {
+		Tags []string `query:"tags" required:"true" doc:"Tags to search for"`
+	}) (*struct {
+		Body struct {
+			Count int `json:"count"`
+		}
+	}, error) {
+		return nil, nil
+	})
+	return api
+}
+
+// TestRequiredListValuedQueryParam covers the required-parameter path, which renders
+// separately from the options struct. It is the more dangerous half of the same bug:
+// the optional version failed to compile, so it could never ship, whereas this one
+// compiled and silently sent Go's slice syntax as the query value.
+func TestRequiredListValuedQueryParam(t *testing.T) {
+	src := generateInto(t, requiredListParamAPI(), "requiredlistapiclient")
+
+	if strings.Contains(src, `requiredQueryValues.Set("tags", fmt.Sprintf("%v", tags))`) {
+		t.Error("required list-valued query param still formatted with Sprintf, which renders Go slice syntax")
+	}
+	if !strings.Contains(src, `requiredQueryValues.Set("tags", joinParamValues(tags))`) {
+		t.Error("required list-valued query param is not joined")
+	}
+	// The helper is gated on a scan of the parameter collections; required params live
+	// in their own, so an API whose only list param is required must still get it.
+	if !strings.Contains(src, "func joinParamValues") {
+		t.Error("joinParamValues not emitted for an API whose only list param is required")
+	}
+
+	var mu sync.Mutex
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = r.URL.Query().Get("tags")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"count": 1})
+	}))
+	t.Cleanup(server.Close)
+
+	prog := `package main
+import ("context";"fmt";"os";c "testprogram/requiredlistapiclient")
+func main() {
+	cl := c.New(os.Args[1])
+	_, _, err := cl.Search(context.Background(), []string{"x", "y"})
+	if err != nil { fmt.Println("ERR", err); os.Exit(1) }
+}`
+	runGeneratedProgram(t, prog, server.URL)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got != "x,y" {
+		t.Errorf("tags query = %q, want %q", got, "x,y")
 	}
 }

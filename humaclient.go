@@ -211,6 +211,7 @@ func generateClientCode(openapi *huma.OpenAPI, packageName string, outputDir str
 		"trimPrefix": strings.TrimPrefix,
 		"trimSuffix": strings.TrimSuffix,
 		"hasPrefix":  strings.HasPrefix,
+		"isList":     isListType,
 		"eq":         func(a, b any) bool { return a == b },
 	}
 
@@ -303,11 +304,18 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 		}
 	}
 
-	// Check whether any optional parameter is list-valued, which needs the
-	// joinParamValues helper to render.
+	// Check whether any parameter is list-valued, which needs the joinParamValues
+	// helper to render. Required and optional params are collected separately, so
+	// both have to be scanned or the helper goes missing for an API whose only list
+	// param is required.
 	for _, op := range data.Operations {
 		for _, f := range op.OptionsFields {
 			if isListType(f.Type) {
+				data.HasListParams = true
+			}
+		}
+		for _, p := range op.RequiredQueryParams {
+			if isListType(p.Type) {
 				data.HasListParams = true
 			}
 		}
@@ -769,7 +777,7 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 	// still carries content — SSE, or any media type this generator does not decode —
 	// the caller is the only one that can read it, so the generated method must leave
 	// it open. Everything else is closed by the generated method.
-	opData.CallerOwnsBody = !opData.HasResponseBody && (opData.IsSSE || declaresRawResponseBody(operation))
+	opData.CallerOwnsBody = opData.IsSSE || (!opData.HasResponseBody && declaresRawResponseBody(operation))
 
 	// Check for pagination support
 	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath, pagination)
@@ -1101,12 +1109,14 @@ func hasRequestBodies(openapi *huma.OpenAPI) bool {
 
 // hasPaginatedOperations checks if any operation in the API supports pagination
 // isListType reports whether a generated Go type for a parameter is a slice that
-// needs joining to render as a single header or query value. net.IP is excluded: it
-// is a []byte with its own String method and its own template arm.
+// needs joining to render as a single header or query value. Types with their own
+// string form, such as net.IP, are not slices by this test — their generated type
+// name does not start with "[]" — and keep their own template arms.
 func isListType(goType string) bool {
 	return strings.HasPrefix(goType, "[]")
 }
 
+// hasPaginatedOperations checks if any operation in the API is paginated
 func hasPaginatedOperations(openapi *huma.OpenAPI, pagination *PaginationOptions) bool {
 	return hasAnyOperation(openapi, func(op *huma.Operation) bool {
 		return isPaginatedOperation(op, openapi, pagination)
@@ -1271,7 +1281,6 @@ func generateMethodName(operation *huma.Operation) string {
 	return "Operation"
 }
 
-// generateReturnType generates the return type for an operation method
 // declaresRawResponseBody reports whether a success response declares content this
 // generator does not decode: an octet-stream download, text/plain, text/event-stream.
 // generateReturnType only recognises application/json, so such an operation looks
@@ -1279,7 +1288,7 @@ func generateMethodName(operation *huma.Operation) string {
 // that only the caller can interpret.
 func declaresRawResponseBody(operation *huma.Operation) bool {
 	for statusCode, response := range operation.Responses {
-		if statusCode == "" || statusCode[0] != '2' || len(response.Content) == 0 {
+		if statusCode == "" || statusCode[0] != '2' || response == nil || len(response.Content) == 0 {
 			continue
 		}
 		if response.Content["application/json"] == nil {
@@ -1289,6 +1298,7 @@ func declaresRawResponseBody(operation *huma.Operation) bool {
 	return false
 }
 
+// generateReturnType generates the return type for an operation method
 func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) (string, string, bool) {
 	// Find the success response (200, 201, etc.)
 	var responseSchema *huma.Schema
@@ -1797,7 +1807,7 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 	if !o.{{.Name}}.IsZero() {
 {{- else if eq .Type "net.IP"}}
 	if len(o.{{.Name}}) != 0 {
-{{- else if hasPrefix .Type "[]"}}
+{{- else if isList .Type}}
 	if len(o.{{.Name}}) != 0 {
 {{- else if hasPrefix .Type "*"}}
 	if o.{{.Name}} != nil {
@@ -1810,7 +1820,7 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		}
 {{- if eq .Type "string"}}
 		opts.CustomQuery["{{.JSONName}}"] = o.{{.Name}}
-{{- else if hasPrefix .Type "[]"}}
+{{- else if isList .Type}}
 		opts.CustomQuery["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
 {{- else}}
 		opts.CustomQuery["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
@@ -1821,7 +1831,7 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		}
 {{- if eq .Type "string"}}
 		opts.CustomHeaders["{{.JSONName}}"] = o.{{.Name}}
-{{- else if hasPrefix .Type "[]"}}
+{{- else if isList .Type}}
 		opts.CustomHeaders["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
 {{- else}}
 		opts.CustomHeaders["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
@@ -2000,6 +2010,8 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- range .RequiredQueryParams}}
 {{- if eq .Type "string"}}
 	requiredQueryValues.Set("{{.Name}}", {{.GoNameLowerCamel}})
+{{- else if isList .Type}}
+	requiredQueryValues.Set("{{.Name}}", joinParamValues({{.GoNameLowerCamel}}))
 {{- else}}
 	requiredQueryValues.Set("{{.Name}}", fmt.Sprintf("%v", {{.GoNameLowerCamel}}))
 {{- end}}
