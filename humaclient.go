@@ -1822,6 +1822,10 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		opts.CustomQuery["{{.JSONName}}"] = o.{{.Name}}
 {{- else if isList .Type}}
 		opts.CustomQuery["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
+{{- else if eq .Type "time.Time"}}
+		opts.CustomQuery["{{.JSONName}}"] = o.{{.Name}}.Format(time.RFC3339Nano)
+{{- else if hasPrefix .Type "*"}}
+		opts.CustomQuery["{{.JSONName}}"] = fmt.Sprintf("%v", *o.{{.Name}})
 {{- else}}
 		opts.CustomQuery["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
 {{- end}}
@@ -1833,6 +1837,10 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		opts.CustomHeaders["{{.JSONName}}"] = o.{{.Name}}
 {{- else if isList .Type}}
 		opts.CustomHeaders["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
+{{- else if eq .Type "time.Time"}}
+		opts.CustomHeaders["{{.JSONName}}"] = o.{{.Name}}.Format(time.RFC3339Nano)
+{{- else if hasPrefix .Type "*"}}
+		opts.CustomHeaders["{{.JSONName}}"] = fmt.Sprintf("%v", *o.{{.Name}})
 {{- else}}
 		opts.CustomHeaders["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
 {{- end}}
@@ -2012,6 +2020,8 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 	requiredQueryValues.Set("{{.Name}}", {{.GoNameLowerCamel}})
 {{- else if isList .Type}}
 	requiredQueryValues.Set("{{.Name}}", joinParamValues({{.GoNameLowerCamel}}))
+{{- else if eq .Type "time.Time"}}
+	requiredQueryValues.Set("{{.Name}}", {{.GoNameLowerCamel}}.Format(time.RFC3339Nano))
 {{- else}}
 	requiredQueryValues.Set("{{.Name}}", fmt.Sprintf("%v", {{.GoNameLowerCamel}}))
 {{- end}}
