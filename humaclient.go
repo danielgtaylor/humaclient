@@ -55,6 +55,8 @@ type ClientTemplateData struct {
 	HasMergePatch       bool // Whether any operation supports both merge-patch+json and json-patch+json (autopatch)
 	HasJSONPatchOp      bool // Whether JSONPatchOp already exists as a schema struct
 	HasSSE              bool // Whether any operation uses Server-Sent Events
+	HasListParams       bool // Whether any optional parameter is list-valued and needs joining
+	HasTimeListParams   bool // Whether any list-valued parameter has date-time elements
 }
 
 // SchemaData represents an OpenAPI schema for code generation
@@ -101,6 +103,7 @@ type OperationData struct {
 	NextFieldNilCheck   string             // Nil-check expression for nullable intermediate fields in NextField path
 	ResponseType        string             // Wrapper struct type name for object-wrapped paginated responses
 	IsSSE               bool               // Whether this operation returns text/event-stream (SSE)
+	CallerOwnsBody      bool               // Whether the caller must read and close resp.Body itself
 	SSEEventTypes       []SSEEventTypeData // Event types for SSE operations
 }
 
@@ -209,6 +212,7 @@ func generateClientCode(openapi *huma.OpenAPI, packageName string, outputDir str
 		"trimPrefix": strings.TrimPrefix,
 		"trimSuffix": strings.TrimSuffix,
 		"hasPrefix":  strings.HasPrefix,
+		"isList":     isListType,
 		"eq":         func(a, b any) bool { return a == b },
 	}
 
@@ -298,6 +302,29 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 		if op.IsSSE {
 			data.HasSSE = true
 			break
+		}
+	}
+
+	// Check whether any parameter is list-valued, which needs the joinParamValues
+	// helper to render. Required and optional params are collected separately, so
+	// both have to be scanned or the helper goes missing for an API whose only list
+	// param is required.
+	for _, op := range data.Operations {
+		for _, f := range op.OptionsFields {
+			if isListType(f.Type) {
+				data.HasListParams = true
+				if f.Type == "[]time.Time" {
+					data.HasTimeListParams = true
+				}
+			}
+		}
+		for _, p := range op.RequiredQueryParams {
+			if isListType(p.Type) {
+				data.HasListParams = true
+				if p.Type == "[]time.Time" {
+					data.HasTimeListParams = true
+				}
+			}
 		}
 	}
 
@@ -753,6 +780,12 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 	// Check for SSE (Server-Sent Events) support
 	handleSSE(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath)
 
+	// Decide who closes the response body. When nothing is decoded but the response
+	// still carries content — SSE, or any media type this generator does not decode —
+	// the caller is the only one that can read it, so the generated method must leave
+	// it open. Everything else is closed by the generated method.
+	opData.CallerOwnsBody = opData.IsSSE || (!opData.HasResponseBody && declaresRawResponseBody(operation))
+
 	// Check for pagination support
 	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath, pagination)
 
@@ -1082,6 +1115,15 @@ func hasRequestBodies(openapi *huma.OpenAPI) bool {
 }
 
 // hasPaginatedOperations checks if any operation in the API supports pagination
+// isListType reports whether a generated Go type for a parameter is a slice that
+// needs joining to render as a single header or query value. Types with their own
+// string form, such as net.IP, are not slices by this test — their generated type
+// name does not start with "[]" — and keep their own template arms.
+func isListType(goType string) bool {
+	return strings.HasPrefix(goType, "[]")
+}
+
+// hasPaginatedOperations checks if any operation in the API is paginated
 func hasPaginatedOperations(openapi *huma.OpenAPI, pagination *PaginationOptions) bool {
 	return hasAnyOperation(openapi, func(op *huma.Operation) bool {
 		return isPaginatedOperation(op, openapi, pagination)
@@ -1244,6 +1286,23 @@ func generateMethodName(operation *huma.Operation) string {
 	}
 
 	return "Operation"
+}
+
+// declaresRawResponseBody reports whether a success response declares content this
+// generator does not decode: an octet-stream download, text/plain, text/event-stream.
+// generateReturnType only recognises application/json, so such an operation looks
+// bodyless to the rest of the generator even though the response does carry content
+// that only the caller can interpret.
+func declaresRawResponseBody(operation *huma.Operation) bool {
+	for statusCode, response := range operation.Responses {
+		if statusCode == "" || statusCode[0] != '2' || response == nil || len(response.Content) == 0 {
+			continue
+		}
+		if response.Content["application/json"] == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // generateReturnType generates the return type for an operation method
@@ -1667,6 +1726,50 @@ func WithOptions(applier OptionsApplier) Option {
 		applier.Apply(opts)
 	}
 }
+// bodyAllowedForStatus reports whether a response with the given status code is
+// permitted to carry content. Informational (1xx), 204 No Content, 205 Reset Content,
+// and 304 Not Modified never do, so there is nothing to decode and the returned
+// result is left as its zero value. The operation still succeeded: inspect the
+// returned *http.Response to tell these apart from a 200.
+//
+// This follows RFC 9110, which says of each of these that it "cannot contain
+// content". net/http's own unexported bodyAllowedForStatus omits 205; that is the
+// only difference, and it is deliberate.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusResetContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
+{{if .HasListParams}}
+// joinParamValues renders a list-valued parameter as a single comma-separated value.
+// That is the "simple" style OpenAPI applies to header parameters by default, and
+// "form" with explode=false for query parameters.
+func joinParamValues[T any](values []T) string {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		switch e := any(v).(type) {
+{{- if .HasTimeListParams}}
+		case time.Time:
+			// The layout the server parses, matching the scalar date-time case.
+			parts[i] = e.Format(time.RFC3339Nano)
+{{- end}}
+		case string:
+			parts[i] = e
+		default:
+			parts[i] = fmt.Sprintf("%v", e)
+		}
+	}
+	return strings.Join(parts, ",")
+}
+{{end}}
 {{if .HasMergePatch}}
 // Patchable is an interface for types that can be used as PATCH request bodies.
 // It is implemented by MergePatch and JSONPatch.
@@ -1726,6 +1829,8 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 	if !o.{{.Name}}.IsZero() {
 {{- else if eq .Type "net.IP"}}
 	if len(o.{{.Name}}) != 0 {
+{{- else if isList .Type}}
+	if len(o.{{.Name}}) != 0 {
 {{- else if hasPrefix .Type "*"}}
 	if o.{{.Name}} != nil {
 {{- else}}
@@ -1737,6 +1842,12 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		}
 {{- if eq .Type "string"}}
 		opts.CustomQuery["{{.JSONName}}"] = o.{{.Name}}
+{{- else if isList .Type}}
+		opts.CustomQuery["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
+{{- else if eq .Type "time.Time"}}
+		opts.CustomQuery["{{.JSONName}}"] = o.{{.Name}}.Format(time.RFC3339Nano)
+{{- else if hasPrefix .Type "*"}}
+		opts.CustomQuery["{{.JSONName}}"] = fmt.Sprintf("%v", *o.{{.Name}})
 {{- else}}
 		opts.CustomQuery["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
 {{- end}}
@@ -1746,6 +1857,12 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		}
 {{- if eq .Type "string"}}
 		opts.CustomHeaders["{{.JSONName}}"] = o.{{.Name}}
+{{- else if isList .Type}}
+		opts.CustomHeaders["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
+{{- else if eq .Type "time.Time"}}
+		opts.CustomHeaders["{{.JSONName}}"] = o.{{.Name}}.Format(time.RFC3339Nano)
+{{- else if hasPrefix .Type "*"}}
+		opts.CustomHeaders["{{.JSONName}}"] = fmt.Sprintf("%v", *o.{{.Name}})
 {{- else}}
 		opts.CustomHeaders["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
 {{- end}}
@@ -1892,6 +2009,18 @@ func NewWithClient(baseURL string, client *http.Client) {{.ClientInterfaceName}}
 {{/* Generate method implementations */}}
 {{- range .Operations}}
 // {{.MethodName}} calls the {{.HTTPMethod}} {{.Path}} endpoint
+{{- if .CallerOwnsBody}}
+//
+{{- if .IsSSE}}
+// The response body is neither read nor closed here, because it is an event stream.
+// Prefer {{.MethodName}}Stream, which parses the events and closes the body for you;
+// call this directly only to read the raw stream, and close the body yourself.
+{{- else}}
+// The response body is neither read nor closed here, because this endpoint returns
+// content the SDK does not decode. Read it from the returned response, and close it
+// when you are done.
+{{- end}}
+{{- end}}
 func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}} {
 	// Apply options
 	reqOpts := &RequestOptions{}
@@ -1923,6 +2052,10 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- range .RequiredQueryParams}}
 {{- if eq .Type "string"}}
 	requiredQueryValues.Set("{{.Name}}", {{.GoNameLowerCamel}})
+{{- else if isList .Type}}
+	requiredQueryValues.Set("{{.Name}}", joinParamValues({{.GoNameLowerCamel}}))
+{{- else if eq .Type "time.Time"}}
+	requiredQueryValues.Set("{{.Name}}", {{.GoNameLowerCamel}}.Format(time.RFC3339Nano))
 {{- else}}
 	requiredQueryValues.Set("{{.Name}}", fmt.Sprintf("%v", {{.GoNameLowerCamel}}))
 {{- end}}
@@ -1992,13 +2125,17 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 		return nil, fmt.Errorf("request failed: %w", err)
 {{- end}}
 	}
-{{- if .HasResponseBody}}
+{{- if not .CallerOwnsBody}}
 	defer resp.Body.Close()
+{{- else}}
+	{{/* The caller reads resp.Body after this returns — an SSE stream, or a media
+	     type this SDK does not decode — so closing it here would truncate it. */}}
 {{- end}}
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
-{{- if not .HasResponseBody}}
+{{- if .CallerOwnsBody}}
+		// An error response carries no content for the caller to read.
 		defer resp.Body.Close()
 {{- end}}
 		body, _ := io.ReadAll(resp.Body)
@@ -2012,6 +2149,10 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 {{- if .HasResponseBody}}
 	// Parse response body
 	var result {{trimPrefix (trimSuffix .ReturnType ", error)") "(*http.Response, "}}
+	if !bodyAllowedForStatus(resp.StatusCode) {
+		// The status carries no content, so the zero value is the result.
+		return resp, result, nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return resp, {{.ZeroValue}}, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -2081,6 +2222,10 @@ func (c *{{.ClientStructName}}) Follow(ctx context.Context, link string, result 
 	}
 
 	// Parse response body into provided result type
+	if !bodyAllowedForStatus(resp.StatusCode) {
+		// The status carries no content, so result is left untouched.
+		return resp, nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
 		return resp, fmt.Errorf("failed to decode response: %w", err)
 	}

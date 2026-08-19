@@ -125,6 +125,29 @@ func WithOptions(applier OptionsApplier) Option {
 	}
 }
 
+// bodyAllowedForStatus reports whether a response with the given status code is
+// permitted to carry content. Informational (1xx), 204 No Content, 205 Reset Content,
+// and 304 Not Modified never do, so there is nothing to decode and the returned
+// result is left as its zero value. The operation still succeeded: inspect the
+// returned *http.Response to tell these apart from a 200.
+//
+// This follows RFC 9110, which says of each of these that it "cannot contain
+// content". net/http's own unexported bodyAllowedForStatus omits 205; that is the
+// only difference, and it is deliberate.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusResetContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
+
 // ListThingsOptions contains optional parameters for ListThings
 type ListThingsOptions struct {
 	Limit  int64  `json:"limit,omitempty"`
@@ -275,6 +298,10 @@ func NewWithClient(baseURL string, client *http.Client) ExampleAPIClient {
 }
 
 // WatchChat calls the GET /chat/events endpoint
+//
+// The response body is neither read nor closed here, because it is an event stream.
+// Prefer WatchChatStream, which parses the events and closes the body for you;
+// call this directly only to read the raw stream, and close the body yourself.
 func (c *ExampleAPIClientImpl) WatchChat(ctx context.Context, opts ...Option) (*http.Response, error) {
 	// Apply options
 	reqOpts := &RequestOptions{}
@@ -314,6 +341,7 @@ func (c *ExampleAPIClientImpl) WatchChat(ctx context.Context, opts ...Option) (*
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
+		// An error response carries no content for the caller to read.
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
 		return resp, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
@@ -366,6 +394,10 @@ func (c *ExampleAPIClientImpl) ListThings(ctx context.Context, opts ...Option) (
 	}
 	// Parse response body
 	var result ListThingsResponseBody
+	if !bodyAllowedForStatus(resp.StatusCode) {
+		// The status carries no content, so the zero value is the result.
+		return resp, result, nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return resp, ListThingsResponseBody{}, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -419,6 +451,10 @@ func (c *ExampleAPIClientImpl) GetThingsByID(ctx context.Context, id string, opt
 	}
 	// Parse response body
 	var result Thing
+	if !bodyAllowedForStatus(resp.StatusCode) {
+		// The status carries no content, so the zero value is the result.
+		return resp, result, nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return resp, Thing{}, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -484,6 +520,10 @@ func (c *ExampleAPIClientImpl) Follow(ctx context.Context, link string, result a
 	}
 
 	// Parse response body into provided result type
+	if !bodyAllowedForStatus(resp.StatusCode) {
+		// The status carries no content, so result is left untouched.
+		return resp, nil
+	}
 	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
 		return resp, fmt.Errorf("failed to decode response: %w", err)
 	}
