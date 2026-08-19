@@ -5311,6 +5311,50 @@ func TestOptionalParamNameCollisionSameLocation(t *testing.T) {
 	})
 }
 
+func TestOptionalParamNameCollisionWithReservedName(t *testing.T) {
+	// A suffixed name must not displace a parameter that asked for it directly:
+	// "filter" as both a query and a header wants FilterQuery for the query, but
+	// an unrelated "filter_query" parameter already camel-cases to exactly that.
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Reserved Name API", "1.0.0"))
+
+	huma.Get(api, "/things", func(ctx context.Context, input *struct {
+		Filter      string `query:"filter" doc:"Optional filter"`
+		FilterHdr   string `header:"filter" doc:"Same name, different location"`
+		FilterQuery string `query:"filter_query" doc:"Camel-cases to the suffixed name"`
+	}) (*struct{ Body string }, error) {
+		return &struct{ Body string }{Body: input.Filter}, nil
+	})
+
+	tempDir, err := os.MkdirTemp("", "humaclient_reserved_name_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldDir, _ := os.Getwd()
+	os.Chdir(tempDir)
+	defer os.Chdir(oldDir)
+
+	if err := GenerateClient(api); err != nil {
+		t.Fatalf("Failed to generate client: %v", err)
+	}
+
+	clientFile := "reservednameapiclient/client.go"
+	file := parseGeneratedClient(t, clientFile)
+
+	// The parameter that spells FilterQuery on its own keeps it; the clashing
+	// query takes the next number rather than redeclaring the field.
+	assertOptionsField(t, file, "GetThingsOptions", "FilterQuery")
+	assertOptionsField(t, file, "GetThingsOptions", "FilterQuery2")
+	assertOptionsField(t, file, "GetThingsOptions", "FilterHeader")
+	assertNoOptionsField(t, file, "GetThingsOptions", "Filter")
+
+	assertOptionApplies(t, clientFile, "GetThingsOptions", `opts.CustomQuery["filter_query"] = o.FilterQuery`)
+	assertOptionApplies(t, clientFile, "GetThingsOptions", `opts.CustomQuery["filter"] = o.FilterQuery2`)
+	assertOptionApplies(t, clientFile, "GetThingsOptions", `opts.CustomHeaders["filter"] = o.FilterHeader`)
+}
+
 // assertOptionApplies fails unless the named options struct's Apply method
 // contains the given statement.
 func assertOptionApplies(t *testing.T, clientFile, structName, statement string) {
