@@ -293,6 +293,10 @@ func NewWithClient(baseURL string, client *http.Client) ExampleAPIClient {
 }
 
 // WatchChat calls the GET /chat/events endpoint
+//
+// The response body is neither read nor closed here, because it is an event stream.
+// Prefer WatchChatStream, which parses the events and closes the body for you;
+// call this directly only to read the raw stream, and close the body yourself.
 func (c *ExampleAPIClientImpl) WatchChat(ctx context.Context, opts ...Option) (*http.Response, error) {
 	// Apply options
 	reqOpts := &RequestOptions{}

@@ -1987,6 +1987,18 @@ func NewWithClient(baseURL string, client *http.Client) {{.ClientInterfaceName}}
 {{/* Generate method implementations */}}
 {{- range .Operations}}
 // {{.MethodName}} calls the {{.HTTPMethod}} {{.Path}} endpoint
+{{- if .CallerOwnsBody}}
+//
+{{- if .IsSSE}}
+// The response body is neither read nor closed here, because it is an event stream.
+// Prefer {{.MethodName}}Stream, which parses the events and closes the body for you;
+// call this directly only to read the raw stream, and close the body yourself.
+{{- else}}
+// The response body is neither read nor closed here, because this endpoint returns
+// content the SDK does not decode. Read it from the returned response, and close it
+// when you are done.
+{{- end}}
+{{- end}}
 func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .PathParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{range .RequiredQueryParams}}, {{.GoNameLowerCamel}} {{.Type}}{{end}}{{if .HasRequestBody}}, body {{.RequestBodyType}}{{end}}, opts ...Option) {{.ReturnType}} {
 	// Apply options
 	reqOpts := &RequestOptions{}

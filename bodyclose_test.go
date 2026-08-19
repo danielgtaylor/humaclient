@@ -110,6 +110,12 @@ func TestRawResponseBodyStaysOpen(t *testing.T) {
 		t.Errorf("a non-JSON response body is closed before the caller can read it:\n%s", download)
 	}
 
+	// The contract has to be stated where a caller will see it, since the generated
+	// method deliberately hands back an open body.
+	if !strings.Contains(src, "The response body is neither read nor closed here") {
+		t.Error("the generated method does not tell the caller it owns the response body")
+	}
+
 	// The genuinely bodyless DELETE in the same API must still be closed, or the
 	// exemption is just reintroducing the leak everywhere.
 	del := methodBody(t, src, "func (c *RawAPIClientImpl) DeleteFile(")
