@@ -47,7 +47,7 @@ func generateInto(t *testing.T, api huma.API, pkgDir string) string {
 // client is standalone stdlib-only, so the temp module needs no requirements.
 func runGeneratedProgram(t *testing.T, source, baseURL string) string {
 	t.Helper()
-	if err := os.WriteFile("go.mod", []byte("module testprogram\n\ngo 1.24\n"), 0o644); err != nil {
+	if err := os.WriteFile("go.mod", []byte("module testprogram\n\ngo 1.23\n"), 0o644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
 	if err := os.WriteFile("main.go", []byte(source), 0o644); err != nil {

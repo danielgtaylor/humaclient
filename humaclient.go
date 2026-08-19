@@ -102,6 +102,7 @@ type OperationData struct {
 	NextFieldNilCheck   string             // Nil-check expression for nullable intermediate fields in NextField path
 	ResponseType        string             // Wrapper struct type name for object-wrapped paginated responses
 	IsSSE               bool               // Whether this operation returns text/event-stream (SSE)
+	CallerOwnsBody      bool               // Whether the caller must read and close resp.Body itself
 	SSEEventTypes       []SSEEventTypeData // Event types for SSE operations
 }
 
@@ -764,6 +765,12 @@ func createOperationData(operation *huma.Operation, method, path string, openapi
 	// Check for SSE (Server-Sent Events) support
 	handleSSE(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath)
 
+	// Decide who closes the response body. When nothing is decoded but the response
+	// still carries content — SSE, or any media type this generator does not decode —
+	// the caller is the only one that can read it, so the generated method must leave
+	// it open. Everything else is closed by the generated method.
+	opData.CallerOwnsBody = !opData.HasResponseBody && (opData.IsSSE || declaresRawResponseBody(operation))
+
 	// Check for pagination support
 	handlePagination(&opData, operation, openapi, allowedPackages, externalImports, currentPkgPath, pagination)
 
@@ -1265,6 +1272,23 @@ func generateMethodName(operation *huma.Operation) string {
 }
 
 // generateReturnType generates the return type for an operation method
+// declaresRawResponseBody reports whether a success response declares content this
+// generator does not decode: an octet-stream download, text/plain, text/event-stream.
+// generateReturnType only recognises application/json, so such an operation looks
+// bodyless to the rest of the generator even though the response does carry content
+// that only the caller can interpret.
+func declaresRawResponseBody(operation *huma.Operation) bool {
+	for statusCode, response := range operation.Responses {
+		if statusCode == "" || statusCode[0] != '2' || len(response.Content) == 0 {
+			continue
+		}
+		if response.Content["application/json"] == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func generateReturnType(operation *huma.Operation, openapi *huma.OpenAPI, allowedPackages []string, externalImports map[string]bool, currentPkgPath string) (string, string, bool) {
 	// Find the success response (200, 201, etc.)
 	var responseSchema *huma.Schema
@@ -2045,16 +2069,17 @@ func (c *{{$.ClientStructName}}) {{.MethodName}}(ctx context.Context{{range .Pat
 		return nil, fmt.Errorf("request failed: %w", err)
 {{- end}}
 	}
-{{- if or .HasResponseBody (not .IsSSE)}}
+{{- if not .CallerOwnsBody}}
 	defer resp.Body.Close()
 {{- else}}
-	{{/* An SSE caller reads resp.Body after this returns, so closing it here would
-	     truncate the stream. The generated ...Stream method owns closing it. */}}
+	{{/* The caller reads resp.Body after this returns — an SSE stream, or a media
+	     type this SDK does not decode — so closing it here would truncate it. */}}
 {{- end}}
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
-{{- if and (not .HasResponseBody) .IsSSE}}
+{{- if .CallerOwnsBody}}
+		// An error response carries no content for the caller to read.
 		defer resp.Body.Close()
 {{- end}}
 		body, _ := io.ReadAll(resp.Body)
