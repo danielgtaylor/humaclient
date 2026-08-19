@@ -55,6 +55,7 @@ type ClientTemplateData struct {
 	HasMergePatch       bool // Whether any operation supports both merge-patch+json and json-patch+json (autopatch)
 	HasJSONPatchOp      bool // Whether JSONPatchOp already exists as a schema struct
 	HasSSE              bool // Whether any operation uses Server-Sent Events
+	HasListParams       bool // Whether any optional parameter is list-valued and needs joining
 }
 
 // SchemaData represents an OpenAPI schema for code generation
@@ -298,6 +299,16 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 		if op.IsSSE {
 			data.HasSSE = true
 			break
+		}
+	}
+
+	// Check whether any optional parameter is list-valued, which needs the
+	// joinParamValues helper to render.
+	for _, op := range data.Operations {
+		for _, f := range op.OptionsFields {
+			if isListType(f.Type) {
+				data.HasListParams = true
+			}
 		}
 	}
 
@@ -1082,6 +1093,13 @@ func hasRequestBodies(openapi *huma.OpenAPI) bool {
 }
 
 // hasPaginatedOperations checks if any operation in the API supports pagination
+// isListType reports whether a generated Go type for a parameter is a slice that
+// needs joining to render as a single header or query value. net.IP is excluded: it
+// is a []byte with its own String method and its own template arm.
+func isListType(goType string) bool {
+	return strings.HasPrefix(goType, "[]")
+}
+
 func hasPaginatedOperations(openapi *huma.OpenAPI, pagination *PaginationOptions) bool {
 	return hasAnyOperation(openapi, func(op *huma.Operation) bool {
 		return isPaginatedOperation(op, openapi, pagination)
@@ -1667,6 +1685,18 @@ func WithOptions(applier OptionsApplier) Option {
 		applier.Apply(opts)
 	}
 }
+{{if .HasListParams}}
+// joinParamValues renders a list-valued parameter as a single comma-separated value.
+// That is the "simple" style OpenAPI applies to header parameters by default, and
+// "form" with explode=false for query parameters.
+func joinParamValues[T any](values []T) string {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		parts[i] = fmt.Sprintf("%v", v)
+	}
+	return strings.Join(parts, ",")
+}
+{{end}}
 {{if .HasMergePatch}}
 // Patchable is an interface for types that can be used as PATCH request bodies.
 // It is implemented by MergePatch and JSONPatch.
@@ -1726,6 +1756,8 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 	if !o.{{.Name}}.IsZero() {
 {{- else if eq .Type "net.IP"}}
 	if len(o.{{.Name}}) != 0 {
+{{- else if hasPrefix .Type "[]"}}
+	if len(o.{{.Name}}) != 0 {
 {{- else if hasPrefix .Type "*"}}
 	if o.{{.Name}} != nil {
 {{- else}}
@@ -1737,6 +1769,8 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		}
 {{- if eq .Type "string"}}
 		opts.CustomQuery["{{.JSONName}}"] = o.{{.Name}}
+{{- else if hasPrefix .Type "[]"}}
+		opts.CustomQuery["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
 {{- else}}
 		opts.CustomQuery["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
 {{- end}}
@@ -1746,6 +1780,8 @@ func (o {{.OptionsStructName}}) Apply(opts *RequestOptions) {
 		}
 {{- if eq .Type "string"}}
 		opts.CustomHeaders["{{.JSONName}}"] = o.{{.Name}}
+{{- else if hasPrefix .Type "[]"}}
+		opts.CustomHeaders["{{.JSONName}}"] = joinParamValues(o.{{.Name}})
 {{- else}}
 		opts.CustomHeaders["{{.JSONName}}"] = fmt.Sprintf("%v", o.{{.Name}})
 {{- end}}
