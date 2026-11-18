@@ -15,6 +15,12 @@ import (
 // invalid Go is otherwise only visible to downstream users.
 func generateInto(t *testing.T, api huma.API, pkgDir string) string {
 	t.Helper()
+	return generateIntoWithOptions(t, api, Options{}, pkgDir)
+}
+
+// generateIntoWithOptions is generateInto with generator options.
+func generateIntoWithOptions(t *testing.T, api huma.API, opts Options, pkgDir string) string {
+	t.Helper()
 	tempDir, err := os.MkdirTemp("", "humaclient_test_*")
 	if err != nil {
 		t.Fatalf("temp dir: %v", err)
@@ -27,8 +33,8 @@ func generateInto(t *testing.T, api huma.API, pkgDir string) string {
 	}
 	t.Cleanup(func() { os.Chdir(oldDir) })
 
-	if err := GenerateClient(api); err != nil {
-		t.Fatalf("GenerateClient: %v", err)
+	if err := GenerateClientWithOptions(api, opts); err != nil {
+		t.Fatalf("GenerateClientWithOptions: %v", err)
 	}
 	clientFile := pkgDir + "/client.go"
 	src, err := os.ReadFile(clientFile)
@@ -47,7 +53,14 @@ func generateInto(t *testing.T, api huma.API, pkgDir string) string {
 // client is standalone stdlib-only, so the temp module needs no requirements.
 func runGeneratedProgram(t *testing.T, source, baseURL string) string {
 	t.Helper()
-	if err := os.WriteFile("go.mod", []byte("module testprogram\n\ngo 1.23\n"), 0o644); err != nil {
+	return runGeneratedProgramGo(t, "1.23", source, baseURL)
+}
+
+// runGeneratedProgramGo is runGeneratedProgram with the temp module's go directive,
+// for generated code that needs a newer language or standard library.
+func runGeneratedProgramGo(t *testing.T, goVersion, source, baseURL string) string {
+	t.Helper()
+	if err := os.WriteFile("go.mod", []byte("module testprogram\n\ngo "+goVersion+"\n"), 0o644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
 	if err := os.WriteFile("main.go", []byte(source), 0o644); err != nil {

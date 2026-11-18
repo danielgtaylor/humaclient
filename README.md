@@ -397,6 +397,30 @@ defer resp.Body.Close()
 // Read resp.Body manually...
 ```
 
+### Standard Library UUIDs
+
+Go 1.27 added the [`uuid`](https://pkg.go.dev/uuid) package to the standard library. Set `StdlibUUID` to generate `uuid.UUID` for string schemas with `format: uuid` (which Huma documents for its own `uuid.UUID` fields on Go 1.27) instead of `string`:
+
+```go
+humaclient.RegisterWithOptions(api, humaclient.Options{
+	StdlibUUID: true,
+})
+```
+
+```go
+type Thing struct {
+	ID     uuid.UUID  `json:"id" format:"uuid"`
+	Owner  uuid.UUID  `json:"owner,omitzero" format:"uuid"`
+	Parent *uuid.UUID `json:"parent,omitempty" format:"uuid"`
+}
+```
+
+- Optional `uuid.UUID` fields use `omitzero`, since `omitempty` never omits an array: an unset UUID is left out of the body instead of being sent as the nil UUID.
+- Query and header parameters are sent with `.String()`, and an optional one is only sent when it is not the zero UUID. Path parameters stay `string`, as they do for every format.
+- The generated client imports `uuid`, so the module it lives in needs `go 1.27` or newer.
+
+The option is off by default: turning it on changes field and parameter types from `string`, so callers of an existing client have to update their code.
+
 ### Following Links
 
 Sometimes a response may contain a link to a related resource. There are various mechanisms for accomplishing this, and the client generator is non-opinionated about how you generate and share such links in your response.
