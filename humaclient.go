@@ -1000,11 +1000,8 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, open
 	}
 
 	for _, param := range operation.Parameters {
-		// Only query and header parameters take their Go type from the schema. Path
-		// parameters come from the path template as strings (extractPathParams), so
-		// resolving their schema here would only record an import the generated code
-		// never uses, such as time for a date-time or uuid for a uuid path parameter,
-		// and an unused import does not compile.
+		// Path params are always strings (extractPathParams); resolving their schema
+		// would record an import such as time or uuid that nothing uses.
 		if param.In != "query" && param.In != "header" {
 			continue
 		}
@@ -1535,8 +1532,6 @@ func handleStringType(format string, externalImports map[string]bool, nullable, 
 		}
 		return "time.Time"
 	case "uuid":
-		// Opt-in (Options.StdlibUUID): the uuid package needs Go 1.27, and
-		// switching an existing client's fields from string would break its callers.
 		if stdlibUUID {
 			if externalImports != nil {
 				externalImports["uuid"] = true

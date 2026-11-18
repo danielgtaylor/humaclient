@@ -203,3 +203,33 @@ func TestStdlibUUIDPathOnlyParamImportsNoUUID(t *testing.T) {
 		t.Errorf("the path parameter is not a string:\n%s", methodBody(t, src, "func (c *"))
 	}
 }
+
+// A bare uuid.UUID response needs a uuid.UUID{} zero value in the method body, and
+// a list header goes through the joinParamValues uuid case; both must compile.
+func TestStdlibUUIDBareResponseAndListHeader(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("UUID Response API", "1.0.0"))
+	huma.Get(api, "/ids", func(ctx context.Context, input *struct {
+		IDs []string `header:"X-Ids"`
+	}) (*struct {
+		Body string `format:"uuid"`
+	}, error) {
+		return nil, nil
+	})
+	for _, p := range api.OpenAPI().Paths["/ids"].Get.Parameters {
+		if p.Name == "X-Ids" && p.Schema != nil && p.Schema.Items != nil {
+			p.Schema.Items.Format = "uuid"
+		}
+	}
+
+	src := generateIntoWithOptions(t, api, Options{StdlibUUID: true}, "uuidresponseapiclient")
+	for _, want := range []string{
+		"(*http.Response, uuid.UUID, error)",
+		`opts.CustomHeaders["X-Ids"] = joinParamValues(o.XIds)`,
+		"case uuid.UUID:",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("generated client lacks %q", want)
+		}
+	}
+}
