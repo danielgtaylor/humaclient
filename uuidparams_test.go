@@ -183,3 +183,23 @@ func main() {
 		t.Errorf("an unset optional uuid.UUID went out as %v; it must be left out", gotBody["owner"])
 	}
 }
+
+// An API whose only UUID is a path parameter: path parameters stay string, so the
+// generated client must not import uuid, or it does not compile (unused import).
+func TestStdlibUUIDPathOnlyParamImportsNoUUID(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("UUID Path API", "1.0.0"))
+	huma.Get(api, "/things/{thingID}", func(ctx context.Context, input *struct {
+		ThingID string `path:"thingID" format:"uuid"`
+	}) (*struct{ Body string }, error) {
+		return nil, nil
+	})
+
+	src := generateIntoWithOptions(t, api, Options{StdlibUUID: true}, "uuidpathapiclient")
+	if strings.Contains(src, `"uuid"`) {
+		t.Errorf("a path-only UUID parameter imports uuid:\n%s", src)
+	}
+	if !strings.Contains(src, "thingID string") {
+		t.Errorf("the path parameter is not a string:\n%s", methodBody(t, src, "func (c *"))
+	}
+}

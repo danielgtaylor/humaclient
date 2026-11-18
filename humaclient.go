@@ -1000,6 +1000,14 @@ func buildOperationParams(opData *OperationData, operation *huma.Operation, open
 	}
 
 	for _, param := range operation.Parameters {
+		// Only query and header parameters take their Go type from the schema. Path
+		// parameters come from the path template as strings (extractPathParams), so
+		// resolving their schema here would only record an import the generated code
+		// never uses, such as time for a date-time or uuid for a uuid path parameter,
+		// and an unused import does not compile.
+		if param.In != "query" && param.In != "header" {
+			continue
+		}
 		paramData := createParamData(param, openapi, allowedPackages, externalImports, currentPkgPath, stdlibUUID)
 
 		switch param.In {

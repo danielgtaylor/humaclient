@@ -203,3 +203,17 @@ func TestJoinHelperOmitsTimeCaseWithoutTimeLists(t *testing.T) {
 		t.Error("date-time case emitted for an API with no date-time list params")
 	}
 }
+
+// An API whose only date-time is a path parameter: path parameters stay string, so
+// the generated client must not import time for it, or it does not compile.
+func TestDateTimePathOnlyParamImportsNoTime(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Time Path API", "1.0.0"))
+	huma.Get(api, "/days/{day}", func(ctx context.Context, input *struct {
+		Day string `path:"day" format:"date-time"`
+	}) (*struct{ Body string }, error) {
+		return nil, nil
+	})
+
+	generateInto(t, api, "timepathapiclient")
+}
