@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"go/format"
+	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"text/template"
@@ -377,7 +380,69 @@ func buildTemplateData(openapi *huma.OpenAPI, packageName string, outputDir stri
 	}
 	sort.Strings(data.ExternalImports)
 
+	resolveParamIdents(data.Operations, append(slices.Clone(data.Imports), data.ExternalImports...))
+
 	return data, nil
+}
+
+// methodIdents are the names the operation, paginator and stream method templates
+// declare or call besides their parameters. Keep in sync with those templates.
+var methodIdents = []string{
+	"c", "ctx", "opts", "opt", "body", "reqOpts", "pathTemplate", "u", "err",
+	"requiredQueryValues", "reqBody", "jsonData", "req", "resp", "result",
+	"yield", "items", "item", "zero", "nextURL", "linkHeader", "nextResult", "nextItems", "event",
+	"joinParamValues", "bodyAllowedForStatus", "parseLinkHeader", "parseSSEStream",
+}
+
+// resolveParamIdents renames the Go identifier of any path or required query
+// parameter that would shadow a method local, an imported package or a predeclared
+// identifier, is a keyword, or repeats another parameter of the same operation.
+// Only the Go name changes; the wire name is untouched.
+func resolveParamIdents(ops []OperationData, imports []string) {
+	reserved := make(map[string]bool)
+	for _, name := range methodIdents {
+		reserved[name] = true
+	}
+	for _, name := range types.Universe.Names() {
+		reserved[name] = true
+	}
+	for _, imp := range imports {
+		reserved[importName(strings.Trim(imp, `"`))] = true
+	}
+
+	for i := range ops {
+		used := make(map[string]bool)
+		params := []*ParamData{}
+		for j := range ops[i].PathParams {
+			params = append(params, &ops[i].PathParams[j])
+		}
+		for j := range ops[i].RequiredQueryParams {
+			params = append(params, &ops[i].RequiredQueryParams[j])
+		}
+		for _, p := range params {
+			name := p.GoNameLowerCamel
+			if reserved[name] || used[name] || token.IsKeyword(name) {
+				base := name + "Param"
+				name = base
+				for n := 2; reserved[name] || used[name]; n++ {
+					name = fmt.Sprintf("%s%d", base, n)
+				}
+			}
+			used[name] = true
+			p.GoNameLowerCamel = name
+		}
+	}
+}
+
+// importName is the package name an import path is referenced by, skipping a
+// trailing major-version element such as /v2.
+func importName(path string) string {
+	parts := strings.Split(path, "/")
+	name := parts[len(parts)-1]
+	if len(parts) > 1 && len(name) > 1 && name[0] == 'v' && strings.Trim(name[1:], "0123456789") == "" {
+		name = parts[len(parts)-2]
+	}
+	return name
 }
 
 // determineCurrentPackagePath attempts to determine the import path for the current package

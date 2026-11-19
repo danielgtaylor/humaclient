@@ -233,3 +233,22 @@ func TestStdlibUUIDBareResponseAndListHeader(t *testing.T) {
 		}
 	}
 }
+
+// A path parameter named uuid must not shadow the uuid package the method body
+// needs for a bare uuid.UUID response.
+func TestStdlibUUIDParamNamedUUID(t *testing.T) {
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("UUID Name API", "1.0.0"))
+	huma.Get(api, "/things/{uuid}", func(ctx context.Context, input *struct {
+		UUID string `path:"uuid" format:"uuid"`
+	}) (*struct {
+		Body string `format:"uuid"`
+	}, error) {
+		return nil, nil
+	})
+
+	src := generateIntoWithOptions(t, api, Options{StdlibUUID: true}, "uuidnameapiclient")
+	if !strings.Contains(src, "uuidParam string, opts ...Option) (*http.Response, uuid.UUID, error)") {
+		t.Errorf("the uuid path parameter was not renamed:\n%s", methodBody(t, src, "func (c *"))
+	}
+}
